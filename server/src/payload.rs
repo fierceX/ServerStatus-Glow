@@ -97,7 +97,7 @@ pub struct HostStat {
     // false: KiB (1024), true: KB (1000)
     #[serde(default = "Default::default")]
     pub si: bool,
-    #[serde(default = "Default::default", skip_serializing)]
+    #[serde(skip_serializing_if = "Vec::is_empty", default = "Default::default")]
     pub disks: Vec<DiskInfo>,
 }
 

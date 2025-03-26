@@ -381,12 +381,12 @@ impl StatsMgr {
                 if let Some(srv) = srv_list[idx].as_object_mut() {
                     srv.insert("ip_info".into(), serde_json::to_value(stat.ip_info.as_ref())?);
                     srv.insert("sys_info".into(), serde_json::to_value(stat.sys_info.as_ref())?);
+                    if !stat.disks.is_empty() {
+                        srv.insert("disks".into(), serde_json::to_value(&stat.disks)?);
+                    }
                 }
             }
-        } else {
-            // todo!()
-        };
-
+        }
         Ok(resp_json)
     }
 }
