@@ -133,6 +133,37 @@ pub fn get_sys_traffic(args: &Args) -> (u64, u64) {
 }
 
 static DF_CMD:&str = "df -Tlm --total -t ext4 -t ext3 -t ext2 -t reiserfs -t jfs -t ntfs -t fat32 -t btrfs -t fuseblk -t zfs -t simfs -t xfs";
+
+fn get_zfs_pools() -> Vec<(String, u64, u64)> {
+    let output = Command::new("zpool")
+        .args(["list", "-Hp", "-o", "name,size,alloc"])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            if !output.status.success() {
+                return vec![];
+            }
+            
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() >= 3 {
+                        // 将字节转换为MB
+                        let total = fields[1].parse::<u64>().unwrap_or(0) / (1024 * 1024);
+                        let used = fields[2].parse::<u64>().unwrap_or(0) / (1024 * 1024);
+                        Some((fields[0].to_string(), total, used))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        Err(_) => vec![]
+    }
+}
+
 pub fn get_hdd(stat: &mut StatRequest) {
     let (mut hdd_total, mut hdd_used) = (0, 0);
     let a = &Command::new("/bin/sh")
@@ -143,6 +174,7 @@ pub fn get_hdd(stat: &mut StatRequest) {
 
     let _ = str::from_utf8(a).map(|content| {
         let vs = content.trim().split('\n').collect::<Vec<&str>>().to_vec();
+        let mut zfs_found = false;
 
         for (idx, s) in vs.iter().enumerate() {
             // header
@@ -156,14 +188,33 @@ pub fn get_hdd(stat: &mut StatRequest) {
                 stat.hdd_total = vec[2].parse::<u64>().unwrap();
                 stat.hdd_used = vec[3].parse::<u64>().unwrap();
             } else {
+                let fs_type = vec[1].to_lowercase();
+                if fs_type == "zfs" {
+                    zfs_found = true;
+                }
+                
                 let di = DiskInfo {
                     name: vec[0].to_string(),
                     mount_point: vec[6].to_string(),
                     file_system: vec[1].to_string(),
-                    // TODO: fix this
                     total: vec[2].parse::<u64>().unwrap() * 1024 * 1024,
                     used: vec[3].parse::<u64>().unwrap() * 1024 * 1024,
                     free: vec[4].parse::<u64>().unwrap() * 1024 * 1024,
+                };
+                stat.disks.push(di);
+            }
+        }
+
+        // 如果发现 ZFS 文件系统，获取存储池信息
+        if zfs_found {
+            for (pool_name, total, used) in get_zfs_pools() {
+                let di = DiskInfo {
+                    name: format!("zpool-{}", pool_name),
+                    mount_point: format!("/{}", pool_name),
+                    file_system: "zfs".to_string(),
+                    total: total * 1024 * 1024,
+                    used: used * 1024 * 1024,
+                    free: (total - used) * 1024 * 1024,
                 };
                 stat.disks.push(di);
             }

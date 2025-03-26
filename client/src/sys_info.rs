@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 use sysinfo::CpuRefreshKind;
 use sysinfo::{Components, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
+use std::process::Command;
 
 use crate::status;
 use crate::vnstat;
@@ -91,6 +92,36 @@ pub fn start_net_speed_collect_t(args: &Args) {
     });
 }
 
+fn get_zfs_pools() -> Vec<(String, u64, u64)> {
+    let output = Command::new("zpool")
+        .args(["list", "-Hp", "-o", "name,size,alloc"])
+        .output();
+    
+    match output {
+        Ok(output) => {
+            if !output.status.success() {
+                return vec![];
+            }
+            
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if fields.len() >= 3 {
+                        // 将字节转换为字节
+                        let total = fields[1].parse::<u64>().unwrap_or(0);
+                        let used = fields[2].parse::<u64>().unwrap_or(0);
+                        Some((fields[0].to_string(), total, used))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        Err(_) => vec![]
+    }
+}
+
 pub fn sample(args: &Args, stat: &mut StatRequest) {
     stat.version = env!("CARGO_PKG_VERSION").to_string();
     stat.vnstat = args.vnstat;
@@ -135,17 +166,25 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
     let mut uniq_disk_set = HashSet::new();
 
     let disks = Disks::new_with_refreshed_list();
+    let mut zfs_found = false;
+    
     for disk in &disks {
+        let fs = disk.file_system().to_str().unwrap().to_string();
+        if fs.to_lowercase() == "zfs" {
+            zfs_found = true;
+            continue;  // 跳过 ZFS 文件系统，避免重复计算
+        }
+        
         let di = DiskInfo {
             name: disk.name().to_str().unwrap().to_string(),
             mount_point: disk.mount_point().to_str().unwrap().to_string(),
-            file_system: disk.file_system().to_str().unwrap().to_string(),
+            file_system: fs.clone(),
             total: disk.total_space(),
             used: disk.total_space() - disk.available_space(),
             free: disk.available_space(),
         };
 
-        let fs = di.file_system.to_lowercase();
+        let fs = fs.to_lowercase();
         if G_EXPECT_FS.iter().any(|&k| fs.contains(k)) {
             #[cfg(not(target_os = "windows"))]
             {
@@ -160,6 +199,21 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
         }
 
         stat.disks.push(di);
+    }
+
+    // 如果发现 ZFS 文件系统，获取存储池信息
+    if zfs_found {
+        for (pool_name, total, used) in get_zfs_pools() {
+            let di = DiskInfo {
+                name: format!("zpool-{}", pool_name),
+                mount_point: format!("/{}", pool_name),
+                file_system: "zfs".to_string(),
+                total,
+                used,
+                free: total - used,
+            };
+            stat.disks.push(di);
+        }
     }
 
     stat.hdd_total = hdd_total / unit.pow(2);

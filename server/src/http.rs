@@ -307,7 +307,7 @@ pub async fn get_detail(
         "IP",
         "系统信息",
         "IP信息",
-        "磁盘信息"
+        "存储信息"
     ]);
     for (idx, host) in o.servers.iter().enumerate() {
         let sys_info = host
@@ -329,11 +329,17 @@ pub async fn get_detail(
             })
             .unwrap_or_default();
 
-        let mut di: String = "".to_string();
+        let mut di = String::new();
         if !host.disks.is_empty() {
             let mut t = Table::new();
-            t.set_titles(row!["name", "mp", "fs", "total", "used", "free"]);
-            for disk in &host.disks {
+            t.set_titles(row!["名称", "挂载点", "类型", "总容量", "已用", "可用"]);
+            
+            // 先显示普通文件系统
+            let normal_disks: Vec<_> = host.disks.iter()
+                .filter(|disk| disk.file_system.to_lowercase() != "zfs" && !disk.name.starts_with("zpool-"))
+                .collect();
+            
+            for disk in normal_disks {
                 t.add_row(row![
                     disk.name,
                     disk.mount_point,
@@ -343,6 +349,36 @@ pub async fn get_detail(
                     bytes2human(disk.free, 2, host.si),
                 ]);
             }
+            
+            // 如果有 ZFS 存储池，添加一个分隔行
+            let zfs_pools: Vec<_> = host.disks.iter()
+                .filter(|disk| disk.name.starts_with("zpool-"))
+                .collect();
+            
+            if !zfs_pools.is_empty() {
+                t.add_row(row!["--- ZFS 存储池 ---", "---", "---", "---", "---", "---"]);
+                
+                for pool in zfs_pools {
+                    let usage_percent = if pool.total > 0 {
+                        format!("{}%", (pool.used as f64 * 100.0 / pool.total as f64).round())
+                    } else {
+                        "0%".to_string()
+                    };
+                    
+                    t.add_row(row![
+                        pool.name.strip_prefix("zpool-").unwrap_or(&pool.name),
+                        pool.mount_point,
+                        "ZFS",
+                        bytes2human(pool.total, 2, host.si),
+                        format!("{} ({})",
+                            bytes2human(pool.used, 2, host.si),
+                            usage_percent
+                        ),
+                        bytes2human(pool.free, 2, host.si),
+                    ]);
+                }
+            }
+            
             di = t.to_string();
         }
 
