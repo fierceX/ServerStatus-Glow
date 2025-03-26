@@ -279,7 +279,14 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
     } else if "linux".eq(std::env::consts::OS) {
         status::tupd()
     } else if "freebsd".eq(std::env::consts::OS) {
-        freebsd_tupd()
+        #[cfg(target_os = "freebsd")]
+        {
+            freebsd_tupd()
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            (0, 0, 0, 0)
+        }
     } else {
         (0, 0, 0, 0)
     };
