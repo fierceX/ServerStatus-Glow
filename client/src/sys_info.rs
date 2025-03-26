@@ -142,9 +142,9 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
     stat.uptime = System::uptime();
     // load average
     let load_avg = System::load_average();
-    stat.load_1 = load_avg.one;
-    stat.load_5 = load_avg.five;
-    stat.load_15 = load_avg.fifteen;
+    stat.load_1 = (load_avg.one * 100.0).round() / 100.0;
+    stat.load_5 = (load_avg.five * 100.0).round() / 100.0;
+    stat.load_15 = (load_avg.fifteen * 100.0).round() / 100.0;
 
     // mem 不用转。。。(KB -> KiB)
     stat.memory_total = sys.total_memory() / 1024;
