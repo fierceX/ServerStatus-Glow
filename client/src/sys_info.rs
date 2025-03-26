@@ -52,8 +52,7 @@ pub fn start_cpu_percent_collect_t() {
 
         let global_cpu = sys.global_cpu_info();
         if let Ok(mut cpu_percent) = G_CPU_PERCENT.lock() {
-            // 修改这里，将 round() 改为保留两位小数
-            *cpu_percent = (global_cpu.cpu_usage() * 100.0).round() / 100.0;
+            *cpu_percent = (global_cpu.cpu_usage() as f64 * 100.0).round() / 100.0;
         }
 
         thread::sleep(Duration::from_millis(SAMPLE_PERIOD));
@@ -222,7 +221,7 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
     stat.hdd_used = (hdd_total - hdd_avail) / unit.pow(2);
 
     #[cfg(target_os = "freebsd")]
-    fn freebsd_tupd() -> (usize, usize, usize, usize) {
+    fn freebsd_tupd() -> (u32, u32, u32, u32) {
         // 获取 TCP 连接数
         let tcp = Command::new("netstat")
             .args(["-n", "-p", "tcp"])
@@ -231,7 +230,7 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .filter(|line| line.contains("ESTABLISHED"))
-                    .count()
+                    .count() as u32
             })
             .unwrap_or(0);
     
@@ -243,7 +242,7 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .filter(|line| !line.starts_with("Active"))
-                    .count()
+                    .count() as u32
             })
             .unwrap_or(0);
     
@@ -255,7 +254,7 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .count()
-                    .saturating_sub(1)
+                    .saturating_sub(1) as u32
             })
             .unwrap_or(0);
     
@@ -267,7 +266,7 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
                 String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .count()
-                    .saturating_sub(1)
+                    .saturating_sub(1) as u32
             })
             .unwrap_or(0);
     
