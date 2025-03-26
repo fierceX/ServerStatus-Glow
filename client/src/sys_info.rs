@@ -52,7 +52,8 @@ pub fn start_cpu_percent_collect_t() {
 
         let global_cpu = sys.global_cpu_info();
         if let Ok(mut cpu_percent) = G_CPU_PERCENT.lock() {
-            *cpu_percent = global_cpu.cpu_usage().round() as f64;
+            // 修改这里，将 round() 改为保留两位小数
+            *cpu_percent = (global_cpu.cpu_usage() * 100.0).round() / 100.0;
         }
 
         thread::sleep(Duration::from_millis(SAMPLE_PERIOD));
@@ -220,13 +221,67 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
     stat.hdd_total = hdd_total / unit.pow(2);
     stat.hdd_used = (hdd_total - hdd_avail) / unit.pow(2);
 
+    #[cfg(target_os = "freebsd")]
+    fn freebsd_tupd() -> (usize, usize, usize, usize) {
+        // 获取 TCP 连接数
+        let tcp = Command::new("netstat")
+            .args(["-n", "-p", "tcp"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| line.contains("ESTABLISHED"))
+                    .count()
+            })
+            .unwrap_or(0);
+    
+        // 获取 UDP 连接数
+        let udp = Command::new("netstat")
+            .args(["-n", "-p", "udp"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| !line.starts_with("Active"))
+                    .count()
+            })
+            .unwrap_or(0);
+    
+        // 获取进程数
+        let process = Command::new("ps")
+            .args(["-ax"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .count()
+                    .saturating_sub(1)
+            })
+            .unwrap_or(0);
+    
+        // 获取线程数
+        let thread = Command::new("ps")
+            .args(["-axH"])
+            .output()
+            .map(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .count()
+                    .saturating_sub(1)
+            })
+            .unwrap_or(0);
+    
+        (tcp, udp, process, thread)
+    }
+
     // t/u/p/d
     let (t, u, p, d) = if args.disable_tupd {
         (0, 0, 0, 0)
     } else if "linux".eq(std::env::consts::OS) {
         status::tupd()
+    } else if "freebsd".eq(std::env::consts::OS) {
+        freebsd_tupd()
     } else {
-        // sys.processes()
         (0, 0, 0, 0)
     };
     stat.tcp = t;
