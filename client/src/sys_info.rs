@@ -196,9 +196,10 @@ pub fn sample(args: &Args, stat: &mut StatRequest) {
 
             hdd_total += disk.total_space();
             hdd_avail += disk.available_space();
+            stat.disks.push(di);
         }
 
-        stat.disks.push(di);
+        
     }
 
     // 如果发现 ZFS 文件系统，获取存储池信息
