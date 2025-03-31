@@ -188,41 +188,41 @@ impl StatsMgr {
                         info!("update stat `{:?}", stat_t);
                         // 修改 stat_rx 线程中的借用逻辑
                         if let Ok(mut host_stat_map) = stat_map.lock() {
-                        // 创建一个临时变量来存储 pre_stat 的信息
-                        let mut need_notify = false;
-                        let mut ip_info_to_copy = None;
-                        
-                        // 先检查是否存在之前的状态
-                        if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {
-                        if stat_t.ip_info.is_none() {
-                        ip_info_to_copy = pre_stat.ip_info.clone();
-                        }
-                        
-                        if stat_t.notify && (pre_stat.latest_ts + cfg.offline_threshold < stat_t.latest_ts) {
-                        need_notify = true;
-                        }
-                        }
-                        
-                        // 应用之前收集的信息
-                        if let Some(ip_info) = ip_info_to_copy {
-                        stat_t.ip_info = ip_info;
-                        }
-                        
-                        // 保存到数据库
-                        if let Err(e) = db.save_stat(&stat_t) {
-                        error!("Failed to save stat to database: {}", e);
-                        }
-                        
-                        // 克隆一份用于通知和存储
-                        let stat_clone = Cow::Owned(stat_t.clone());
-                        
-                        // 发送通知
-                        if need_notify {
-                        notifier_tx.send((Event::NodeUp, stat_clone.clone()));
-                        }
-                        
-                        // 插入到 map 中
-                        host_stat_map.insert(stat_t.name.to_string(), stat_clone);
+                            // 创建一个临时变量来存储 pre_stat 的信息
+                            let mut need_notify = false;
+                            let mut ip_info_to_copy = None;
+                            
+                            // 先检查是否存在之前的状态
+                            if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {
+                                if stat_t.ip_info.is_none() {
+                                    ip_info_to_copy = pre_stat.ip_info.clone();
+                                }
+                                
+                                if stat_t.notify && (pre_stat.latest_ts + cfg.offline_threshold < stat_t.latest_ts) {
+                                    need_notify = true;
+                                }
+                            }
+                            
+                            // 应用之前收集的信息
+                            if let Some(ip_info) = ip_info_to_copy {
+                                stat_t.ip_info = ip_info;  // 这里已经是 Option<IpInfo> 类型
+                            }
+                            
+                            // 保存到数据库
+                            if let Err(e) = db.save_stat(&stat_t) {
+                                error!("Failed to save stat to database: {}", e);
+                            }
+                            
+                            // 克隆一份用于通知和存储
+                            let stat_clone: Cow<'static, HostStat> = Cow::Owned(stat_t.clone());
+                            
+                            // 发送通知
+                            if need_notify {
+                                notifier_tx.send((Event::NodeUp, stat_clone.clone()));
+                            }
+                            
+                            // 插入到 map 中
+                            host_stat_map.insert(stat_t.name.to_string(), stat_clone);
                         }
                     }
                 }
@@ -435,12 +435,11 @@ impl StatsMgr {
                 "disks_history": {}  // 改为对象，每个挂载点一个数组
             });
             
-            // 填充历史数据
-            let cpu_history = host_data["cpu_history"].as_array_mut().unwrap();
-            let memory_history = host_data["memory_history"].as_array_mut().unwrap();
-            let network_in_history = host_data["network_in_history"].as_array_mut().unwrap();
-            let network_out_history = host_data["network_out_history"].as_array_mut().unwrap();
-            let disks_history = host_data["disks_history"].as_object_mut().unwrap();
+            // 创建临时变量来存储历史数据
+            let mut cpu_data = Vec::new();
+            let mut memory_data = Vec::new();
+            let mut network_in_data = Vec::new();
+            let mut network_out_data = Vec::new();
             
             // 初始化磁盘挂载点
             let mut mount_points = HashSet::new();
@@ -451,12 +450,13 @@ impl StatsMgr {
             }
             
             // 为每个挂载点创建数组
+            let mut disk_data_map: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
             for mount_point in &mount_points {
-                disks_history.insert(mount_point.clone(), serde_json::json!([]));
+                disk_data_map.insert(mount_point.clone(), Vec::new());
             }
             
             for record in &records {
-                cpu_history.push(serde_json::json!({
+                cpu_data.push(serde_json::json!({
                     "timestamp": record.timestamp,
                     "value": record.cpu
                 }));
@@ -467,20 +467,20 @@ impl StatsMgr {
                     0.0
                 };
                 
-                memory_history.push(serde_json::json!({
+                memory_data.push(serde_json::json!({
                     "timestamp": record.timestamp,
                     "value": mem_percent,
                     "total": record.memory_total,
                     "used": record.memory_used
                 }));
                 
-                network_in_history.push(serde_json::json!({
+                network_in_data.push(serde_json::json!({
                     "timestamp": record.timestamp,
                     "value": record.network_in_speed,
                     "total": record.network_in
                 }));
                 
-                network_out_history.push(serde_json::json!({
+                network_out_data.push(serde_json::json!({
                     "timestamp": record.timestamp,
                     "value": record.network_out_speed,
                     "total": record.network_out
@@ -488,14 +488,14 @@ impl StatsMgr {
                 
                 // 处理每个磁盘
                 for disk in &record.disks {
-                    if let Some(disk_array) = disks_history.get_mut(&disk.mount_point) {
+                    if let Some(disk_array) = disk_data_map.get_mut(&disk.mount_point) {
                         let disk_percent = if disk.total > 0 {
                             (disk.used as f64 / disk.total as f64) * 100.0
                         } else {
                             0.0
                         };
                         
-                        disk_array.as_array_mut().unwrap().push(serde_json::json!({
+                        disk_array.push(serde_json::json!({
                             "timestamp": record.timestamp,
                             "value": disk_percent,
                             "total": disk.total,
@@ -503,6 +503,18 @@ impl StatsMgr {
                         }));
                     }
                 }
+            }
+            
+            // 将收集的数据添加到 host_data
+            host_data["cpu_history"] = serde_json::json!(cpu_data);
+            host_data["memory_history"] = serde_json::json!(memory_data);
+            host_data["network_in_history"] = serde_json::json!(network_in_data);
+            host_data["network_out_history"] = serde_json::json!(network_out_data);
+            
+            // 添加磁盘数据
+            let disks_obj = host_data["disks_history"].as_object_mut().unwrap();
+            for (mount_point, data) in disk_data_map {
+                disks_obj.insert(mount_point, serde_json::json!(data));
             }
             
             servers.push(host_data);

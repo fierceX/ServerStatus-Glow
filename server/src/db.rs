@@ -1,6 +1,6 @@
 use anyhow::Result;
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use rusqlite::{params, Connection, Result as SqliteResult};
+use chrono::{Utc};
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
