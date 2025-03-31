@@ -23,11 +23,45 @@ use crate::G_STATS_MGR;
 
 const KIND: &str = "http";
 
-pub async fn get_stats_json() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "application/json")],
-        G_STATS_MGR.get().unwrap().get_stats_json(),
-    )
+pub async fn get_stats_json(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    // 检查是否有时间范围参数
+    if params.contains_key("start_time") || params.contains_key("end_time") {
+        // 获取时间范围参数
+        let now = chrono::Utc::now().timestamp();
+        let start_time = params
+            .get("start_time")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(now - 600); // 默认10分钟前
+        
+        let end_time = params
+            .get("end_time")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(now);
+        
+        // 调用 StatsMgr 的方法获取指定时间范围的数据
+        match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
+            Ok(stats) => (
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
+            ),
+            Err(e) => {
+                error!("Failed to get stats by timerange: {}", e);
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    json!({
+                        "error": format!("Failed to get stats: {}", e),
+                        "code": 500
+                    }).to_string(),
+                )
+            }
+        }
+    } else {
+        // 无参数时返回当前状态（原有功能）
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            G_STATS_MGR.get().unwrap().get_stats_json(),
+        )
+    }
 }
 
 #[allow(unused)]
@@ -36,11 +70,36 @@ pub async fn get_site_config_json() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/json")], "{}")
 }
 
-pub async fn admin_api(_claims: jwt::Claims, Path(path): Path<String>) -> Json<Value> {
+pub async fn admin_api(_claims: jwt::Claims, Path(path): Path<String>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
     match path.as_str() {
         "stats.json" => {
-            let resp = G_STATS_MGR.get().unwrap().get_all_info().unwrap();
-            return Json(resp);
+            // 检查是否有时间范围参数
+            if params.contains_key("start_time") || params.contains_key("end_time") {
+                let now = chrono::Utc::now().timestamp();
+                let start_time = params
+                    .get("start_time")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(now - 600); // 默认10分钟前
+                
+                let end_time = params
+                    .get("end_time")
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(now);
+                
+                match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
+                    Ok(stats) => return Json(stats),
+                    Err(e) => {
+                        error!("Failed to get stats by timerange: {}", e);
+                        return Json(json!({
+                            "error": format!("Failed to get stats: {}", e),
+                            "code": 500
+                        }));
+                    }
+                }
+            } else {
+                let resp = G_STATS_MGR.get().unwrap().get_all_info().unwrap();
+                return Json(resp);
+            }
         }
         "config.json" => {
             let resp = G_CONFIG.get().unwrap().to_json_value().unwrap();

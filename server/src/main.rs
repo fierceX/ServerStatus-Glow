@@ -35,6 +35,7 @@ mod jwt;
 mod notifier;
 mod payload;
 mod stats;
+mod db;
 
 static G_CONFIG: OnceCell<crate::config::Config> = OnceCell::new();
 static G_STATS_MGR: OnceCell<crate::stats::StatsMgr> = OnceCell::new();

@@ -7,11 +7,8 @@ use std::borrow::Borrow;
 use std::borrow::BorrowMut;
 use std::borrow::Cow;
 use std::collections::binary_heap::Iter;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::fs;
-use std::fs::File;
-use std::io::Write;
 use std::sync::mpsc::sync_channel;
 use std::sync::mpsc::SyncSender;
 use std::sync::Arc;
@@ -21,6 +18,8 @@ use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Host;
+use crate::db::Database;
+use crate::db::{DiskRecord, HostStatRecord};
 use crate::notifier::{Event, Notifier};
 use crate::payload::{HostStat, StatsResp};
 
@@ -31,44 +30,33 @@ static STAT_SENDER: OnceCell<SyncSender<Cow<HostStat>>> = OnceCell::new();
 pub struct StatsMgr {
     resp_json: Arc<Mutex<String>>,
     stats_data: Arc<Mutex<StatsResp>>,
+    db: Arc<Database>, // 数据库字段
 }
 
 impl StatsMgr {
     pub fn new() -> Self {
+        // 创建数据库连接
+        let db = Database::new("stats.db").expect("Failed to initialize database");
+        
         Self {
             resp_json: Arc::new(Mutex::new("{}".to_string())),
             stats_data: Arc::new(Mutex::new(StatsResp::new())),
+            db: Arc::new(db),
         }
     }
 
+    // 从数据库加载网络数据，替代原来从stats.json加载
     fn load_last_network(&mut self, hosts_map: &mut HashMap<String, Host>) {
-        let contents = fs::read_to_string("stats.json").unwrap_or_default();
-        if contents.is_empty() {
-            return;
-        }
-
-        if let Ok(stats_json) = serde_json::from_str::<serde_json::Value>(contents.as_str()) {
-            if let Some(servers) = stats_json["servers"].as_array() {
-                for v in servers {
-                    if let (Some(name), Some(last_network_in), Some(last_network_out)) = (
-                        v["name"].as_str(),
-                        v["last_network_in"].as_u64(),
-                        v["last_network_out"].as_u64(),
-                    ) {
-                        if let Some(srv) = hosts_map.get_mut(name) {
-                            srv.last_network_in = last_network_in;
-                            srv.last_network_out = last_network_out;
-
-                            trace!("{} => last in/out ({}/{}))", &name, last_network_in, last_network_out);
-                        }
-                    } else {
-                        error!("invalid json => {:?}", v);
-                    }
+        // 从数据库加载最后的网络数据
+        if let Ok(last_network_data) = self.db.get_last_network_data() {
+            for (name, last_in, last_out) in last_network_data {
+                if let Some(srv) = hosts_map.get_mut(&name) {
+                    srv.last_network_in = last_in;
+                    srv.last_network_out = last_out;
+                    trace!("{} => last in/out ({}/{}))", &name, last_in, last_out);
                 }
-                trace!("load stats.json succ!");
             }
-        } else {
-            warn!("ignore invalid stats.json");
+            trace!("load network data from database succ!");
         }
     }
 
@@ -79,7 +67,7 @@ impl StatsMgr {
     ) -> Result<()> {
         let hosts_map_base = Arc::new(Mutex::new(cfg.hosts_map.clone()));
 
-        // load last_network_in/out
+        // load last_network_in/out from database
         if let Ok(mut hosts_map) = hosts_map_base.lock() {
             self.load_last_network(&mut hosts_map);
         }
@@ -89,6 +77,7 @@ impl StatsMgr {
         let (notifier_tx, notifier_rx) = sync_channel(512);
 
         let stat_map: Arc<Mutex<HashMap<String, Cow<HostStat>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let db = self.db.clone();
 
         // stat_rx thread
         thread::spawn({
@@ -172,6 +161,11 @@ impl StatsMgr {
                             {
                                 info.last_network_in = stat_t.network_in;
                                 info.last_network_out = stat_t.network_out;
+                                
+                                // 更新数据库中的last_network数据
+                                if let Err(e) = db.update_last_network(&stat_t.name, stat_t.network_in, stat_t.network_out) {
+                                    error!("Failed to update last network data: {}", e);
+                                }
                             } else {
                                 stat_t.last_network_in = info.last_network_in;
                                 stat_t.last_network_out = info.last_network_out;
@@ -204,7 +198,11 @@ impl StatsMgr {
                                 }
                             }
                             host_stat_map.insert(stat.name.to_string(), stat);
-                            //trace!("{:?}", host_stat_map);
+                            
+                            // 将数据保存到数据库
+                            if let Err(e) = db.save_stat(&stat_t) {
+                                error!("Failed to save stat to database: {}", e);
+                            }
                         }
                     }
                 }
@@ -218,6 +216,7 @@ impl StatsMgr {
             let hosts_map = hosts_map_base.clone();
             let stat_map = stat_map.clone();
             let notifier_tx = notifier_tx.clone();
+            let db = self.db.clone();
             let mut latest_notify_ts = 0_u64;
             let mut latest_save_ts = 0_u64;
             let mut latest_group_gc = 0_u64;
@@ -308,20 +307,15 @@ impl StatsMgr {
                     a.alias.cmp(&b.alias)
                 });
 
-                // last_network_in/out save /60s
+                // 定期保存网络数据到数据库
                 if latest_save_ts + SAVE_INTERVAL < now {
                     latest_save_ts = now;
                     if !resp.servers.is_empty() {
-                        if let Ok(mut file) = File::create("stats.json") {
-                            file.write_all(serde_json::to_string(&resp).unwrap().as_bytes());
-                            file.flush();
-                            trace!("save stats.json succ!");
-                        } else {
-                            error!("save stats.json fail!");
-                        }
+                        // 不再保存到stats.json，而是确保数据已经保存到数据库
+                        trace!("Stats data saved to database");
                     }
                 }
-                //
+                
                 if let Ok(mut o) = resp_json.lock() {
                     *o = serde_json::to_string(&resp).unwrap();
                 }
@@ -388,5 +382,112 @@ impl StatsMgr {
             }
         }
         Ok(resp_json)
+    }
+    
+    // 在 StatsMgr 实现中添加
+    pub fn get_stats_by_timerange(&self, start_time: i64, end_time: i64) -> Result<serde_json::Value> {
+        let stats = self.db.get_stats_by_timerange(start_time, end_time)?;
+        
+        let mut result = serde_json::json!({
+            "updated": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            "servers": []
+        });
+        
+        let servers = result["servers"].as_array_mut().unwrap();
+        
+        for (host_name, records) in stats {
+            if records.is_empty() {
+                continue;
+            }
+            
+            // 使用最新记录的基本信息
+            let latest = &records[records.len() - 1];
+            
+            let mut host_data = serde_json::json!({
+                "name": host_name,
+                "alias": latest.alias,
+                "online": latest.online,
+                "data_points": records.len(),
+                "cpu_history": [],
+                "memory_history": [],
+                "network_in_history": [],
+                "network_out_history": [],
+                "disks_history": {}  // 改为对象，每个挂载点一个数组
+            });
+            
+            // 填充历史数据
+            let cpu_history = host_data["cpu_history"].as_array_mut().unwrap();
+            let memory_history = host_data["memory_history"].as_array_mut().unwrap();
+            let network_in_history = host_data["network_in_history"].as_array_mut().unwrap();
+            let network_out_history = host_data["network_out_history"].as_array_mut().unwrap();
+            let disks_history = host_data["disks_history"].as_object_mut().unwrap();
+            
+            // 初始化磁盘挂载点
+            let mut mount_points = HashSet::new();
+            for record in &records {
+                for disk in &record.disks {
+                    mount_points.insert(disk.mount_point.clone());
+                }
+            }
+            
+            // 为每个挂载点创建数组
+            for mount_point in &mount_points {
+                disks_history.insert(mount_point.clone(), serde_json::json!([]));
+            }
+            
+            for record in &records {
+                cpu_history.push(serde_json::json!({
+                    "timestamp": record.timestamp,
+                    "value": record.cpu
+                }));
+                
+                let mem_percent = if record.memory_total > 0 {
+                    (record.memory_used as f64 / record.memory_total as f64) * 100.0
+                } else {
+                    0.0
+                };
+                
+                memory_history.push(serde_json::json!({
+                    "timestamp": record.timestamp,
+                    "value": mem_percent,
+                    "total": record.memory_total,
+                    "used": record.memory_used
+                }));
+                
+                network_in_history.push(serde_json::json!({
+                    "timestamp": record.timestamp,
+                    "value": record.network_in_speed,
+                    "total": record.network_in
+                }));
+                
+                network_out_history.push(serde_json::json!({
+                    "timestamp": record.timestamp,
+                    "value": record.network_out_speed,
+                    "total": record.network_out
+                }));
+                
+                // 处理每个磁盘
+                for disk in &record.disks {
+                    if let Some(disk_array) = disks_history.get_mut(&disk.mount_point) {
+                        let disk_percent = if disk.total > 0 {
+                            (disk.used as f64 / disk.total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        
+                        disk_array.as_array_mut().unwrap().push(serde_json::json!({
+                            "timestamp": record.timestamp,
+                            "value": disk_percent,
+                            "total": disk.total,
+                            "used": disk.used
+                        }));
+                    }
+                }
+            }
+            
+            servers.push(host_data);
+        }
+        
+        Ok(result)
     }
 }
