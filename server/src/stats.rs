@@ -186,23 +186,43 @@ impl StatsMgr {
                         }
 
                         info!("update stat `{:?}", stat_t);
+                        // 修改 stat_rx 线程中的借用逻辑
                         if let Ok(mut host_stat_map) = stat_map.lock() {
-                            if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {
-                                if stat_t.ip_info.is_none() {
-                                    stat_t.ip_info = pre_stat.ip_info.to_owned();
-                                }
-
-                                if stat_t.notify && (pre_stat.latest_ts + cfg.offline_threshold < stat_t.latest_ts) {
-                                    // node up notify
-                                    notifier_tx.send((Event::NodeUp, stat.clone()));
-                                }
-                            }
-                            host_stat_map.insert(stat.name.to_string(), stat);
-                            
-                            // 将数据保存到数据库
-                            if let Err(e) = db.save_stat(&stat_t) {
-                                error!("Failed to save stat to database: {}", e);
-                            }
+                        // 创建一个临时变量来存储 pre_stat 的信息
+                        let mut need_notify = false;
+                        let mut ip_info_to_copy = None;
+                        
+                        // 先检查是否存在之前的状态
+                        if let Some(pre_stat) = host_stat_map.get(&stat_t.name) {
+                        if stat_t.ip_info.is_none() {
+                        ip_info_to_copy = pre_stat.ip_info.clone();
+                        }
+                        
+                        if stat_t.notify && (pre_stat.latest_ts + cfg.offline_threshold < stat_t.latest_ts) {
+                        need_notify = true;
+                        }
+                        }
+                        
+                        // 应用之前收集的信息
+                        if let Some(ip_info) = ip_info_to_copy {
+                        stat_t.ip_info = ip_info;
+                        }
+                        
+                        // 保存到数据库
+                        if let Err(e) = db.save_stat(&stat_t) {
+                        error!("Failed to save stat to database: {}", e);
+                        }
+                        
+                        // 克隆一份用于通知和存储
+                        let stat_clone = Cow::Owned(stat_t.clone());
+                        
+                        // 发送通知
+                        if need_notify {
+                        notifier_tx.send((Event::NodeUp, stat_clone.clone()));
+                        }
+                        
+                        // 插入到 map 中
+                        host_stat_map.insert(stat_t.name.to_string(), stat_clone);
                         }
                     }
                 }

@@ -3,6 +3,7 @@ use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crate::payload::HostStat;
 
@@ -160,15 +161,20 @@ impl Database {
         Ok(())
     }
     
+    // 在 save_stat 方法中
+    // 修复 save_stat 方法中的事务处理
     pub fn save_stat(&self, stat: &HostStat) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         
         // 确保主机存在
         let host_id = self.ensure_host_exists(&conn, stat)?;
         let timestamp = Utc::now().timestamp();
         
+        // 开始事务
+        let tx = conn.transaction()?;
+        
         // 保存简化的统计数据
-        conn.execute(
+        tx.execute(
             "INSERT INTO stats (
                 host_id, timestamp, cpu_usage, memory_total, memory_used,
                 network_in, network_out, network_in_speed, network_out_speed, online
@@ -189,8 +195,6 @@ impl Database {
         
         // 保存每个磁盘的数据
         if !stat.disks.is_empty() {
-            let tx = conn.transaction()?;
-            
             for disk in &stat.disks {
                 tx.execute(
                     "INSERT INTO disk_stats (
@@ -206,6 +210,7 @@ impl Database {
                 )?;
             }
             
+            // 提交事务
             tx.commit()?;
         }
         
@@ -300,7 +305,7 @@ impl Database {
                 
                 let disks = disks_stmt.query_map(params![host_id, start_time, end_time], |row| {
                     Ok(DiskRecord {
-                        timestamp: row.get(0)?,
+                        timestamp: row.get(0)?,  // 正确使用 timestamp 字段
                         mount_point: row.get(1)?,
                         total: row.get(2)?,
                         used: row.get(3)?,
@@ -330,33 +335,11 @@ impl Database {
         Ok(result)
     }
     
-    // 添加 HostStatRecord 和 DiskRecord 结构体定义（如果尚未定义）
-    #[derive(Debug, Clone)]
-    pub struct HostStatRecord {
-        pub timestamp: i64,
-        pub cpu: f64,
-        pub memory_total: u64,
-        pub memory_used: u64,
-        pub network_in: u64,
-        pub network_out: u64,
-        pub network_in_speed: u64,
-        pub network_out_speed: u64,
-        pub online: bool,
-        pub alias: String,
-        pub disks: Vec<DiskRecord>,
-    }
-    
-    #[derive(Debug, Clone)]
-    pub struct DiskRecord {
-        pub timestamp: i64,
-        pub mount_point: String,
-        pub total: u64,
-        pub used: u64,
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct DiskRecord {
+    pub timestamp: i64,  // 添加 timestamp 字段
     pub mount_point: String,
     pub total: i64,
     pub used: i64,
