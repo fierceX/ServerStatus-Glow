@@ -205,7 +205,7 @@ impl StatsMgr {
                             
                             // 应用之前收集的信息
                             if let Some(ip_info) = ip_info_to_copy {
-                                stat_t.ip_info = ip_info;  // 这里已经是 Option<IpInfo> 类型
+                                stat_t.ip_info = Some(ip_info);  // 使用Some包装，因为ip_info是IpInfo类型而不是Option<IpInfo>
                             }
                             
                             // 保存到数据库
