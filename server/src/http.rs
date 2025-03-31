@@ -56,11 +56,44 @@ pub async fn get_stats_json(Query(params): Query<HashMap<String, String>>) -> im
             }
         }
     } else {
-        // 无参数时返回当前状态（原有功能）
-        (
-            [(header::CONTENT_TYPE, "application/json")],
-            G_STATS_MGR.get().unwrap().get_stats_json(),
-        )
+        // 无参数时返回当前状态和近10分钟的历史数据
+        let now = chrono::Utc::now().timestamp();
+        let start_time = now - 600; // 10分钟前
+        
+        // 获取当前状态和历史数据
+        let current_stats = G_STATS_MGR.get().unwrap().get_stats_json();
+        
+        match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, now) {
+            Ok(mut history_stats) => {
+                // 将当前状态添加到历史数据中
+                // 注意：这里假设当前状态可以被解析为JSON对象
+                if let Ok(current_json) = serde_json::from_str::<serde_json::Value>(&current_stats) {
+                    // 合并当前状态和历史数据
+                    if let Some(obj) = history_stats.as_object_mut() {
+                        obj.insert("current".to_string(), current_json);
+                    }
+                    
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&history_stats).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                } else {
+                    // 如果解析失败，至少返回历史数据
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        serde_json::to_string(&history_stats).unwrap_or_else(|_| "{}".to_string()),
+                    )
+                }
+            },
+            Err(e) => {
+                error!("Failed to get historical stats: {}", e);
+                // 出错时至少返回当前状态
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    current_stats,
+                )
+            }
+        }
     }
 }
 
