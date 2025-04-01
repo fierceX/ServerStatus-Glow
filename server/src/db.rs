@@ -471,7 +471,7 @@ impl Database {
     }
     
     // 添加清理旧数据的方法
-    pub fn cleanup_old_data(&self, retention_days: i64) -> Result<usize> {
+    pub fn _cleanup_old_data(&self, retention_days: i64) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
         let now = Utc::now().timestamp();
         let cutoff_time = now - (retention_days * 24 * 60 * 60);
@@ -496,8 +496,8 @@ impl Database {
     }
     
     // 添加数据库优化方法
-    pub fn optimize(&self) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
+    pub fn _optimize(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
         
         // 运行VACUUM来整理数据库文件
         conn.execute_batch("VACUUM")?;
