@@ -37,10 +37,6 @@ pub async fn get_stats_json() -> impl IntoResponse {
     )
 }
 
-// 修改后的接口：接收参数，返回历史数据
-use once_cell::sync::OnceCell;
-use tokio::runtime::Runtime;
-
 // 添加全局变量存储历史数据处理线程池
 static HISTORY_RUNTIME: OnceCell<Runtime> = OnceCell::new();
 
