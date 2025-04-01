@@ -18,6 +18,12 @@ impl Database {
         
         let conn = Connection::open(db_path)?;
         
+        // 添加性能优化配置
+        conn.execute("PRAGMA journal_mode = WAL", [])?; // 使用WAL模式提高写入性能
+        conn.execute("PRAGMA synchronous = NORMAL", [])?; // 降低同步级别提高性能
+        conn.execute("PRAGMA cache_size = 10000", [])?; // 增加缓存大小
+        conn.execute("PRAGMA temp_store = MEMORY", [])?; // 临时表存储在内存中
+        
         if need_init {
             Self::init_db(&conn)?;
         }
@@ -155,6 +161,17 @@ impl Database {
                 FOREIGN KEY (host_id) REFERENCES hosts(id),
                 UNIQUE(host_id)
             )",
+            [],
+        )?;
+        
+        // 添加更多索引以提高查询性能
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_disk_stats_host_mount_time ON disk_stats(host_id, mount_point, timestamp)",
+            [],
+        )?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_timestamp ON stats(timestamp)",
             [],
         )?;
         
@@ -443,6 +460,222 @@ impl Database {
                 result.insert(host_name, host_stats);
             }
         }
+        
+        Ok(result)
+    }
+    
+    // 添加异步方法获取历史数据
+    pub async fn get_stats_by_timerange_async(&self, start_time: i64, end_time: i64) -> Result<HashMap<String, Vec<HostStatRecord>>> {
+        // 克隆连接以便在新线程中使用
+        let conn_clone = self.conn.clone();
+        
+        // 在单独的线程中执行查询以避免阻塞
+        let result = tokio::task::spawn_blocking(move || {
+            let conn = conn_clone.lock().unwrap();
+            let mut result = HashMap::new();
+            
+            // 获取时间范围内的所有主机
+            let mut hosts_stmt = conn.prepare(
+                "SELECT DISTINCT h.id, h.name, h.alias 
+                 FROM hosts h
+                 JOIN stats s ON h.id = s.host_id
+                 WHERE s.timestamp BETWEEN ? AND ?"
+            ).ok()?;
+            
+            let hosts = hosts_stmt.query_map(params![start_time, end_time], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2).unwrap_or_default(),
+                ))
+            }).ok()?;
+            
+            // 最大数据点数量，默认600
+            let max_points = 600;
+            
+            for host_result in hosts {
+                let (host_id, host_name, host_alias) = host_result.ok()?;
+                
+                // 计算需要的时间窗口大小
+                let mut count_stmt = conn.prepare(
+                    "SELECT COUNT(*) FROM stats 
+                     WHERE host_id = ? AND timestamp BETWEEN ? AND ?"
+                ).ok()?;
+                
+                let count: i64 = count_stmt.query_row(params![host_id, start_time, end_time], |row| row.get(0)).ok()?;
+                
+                // 如果数据点少于max_points，不需要聚合
+                if count <= max_points as i64 {
+                    // 使用原始查询
+                    let mut stats_stmt = conn.prepare(
+                        "SELECT timestamp, cpu_usage, memory_total, memory_used, 
+                                network_in, network_out, network_in_speed, network_out_speed, online
+                         FROM stats
+                         WHERE host_id = ? AND timestamp BETWEEN ? AND ?
+                         ORDER BY timestamp ASC"
+                    ).ok()?;
+                    
+                    let stats = stats_stmt.query_map(params![host_id, start_time, end_time], |row| {
+                        Ok(HostStatRecord {
+                            timestamp: row.get(0)?,
+                            cpu: row.get(1)?,
+                            memory_total: row.get(2)?,
+                            memory_used: row.get(3)?,
+                            network_in: row.get(4)?,
+                            network_out: row.get(5)?,
+                            network_in_speed: row.get(6)?,
+                            network_out_speed: row.get(7)?,
+                            online: row.get(8)?,
+                            alias: host_alias.clone(),
+                            disks: Vec::new(),
+                        })
+                    }).ok()?;
+                    
+                    let mut host_stats = Vec::new();
+                    for stat_result in stats {
+                        host_stats.push(stat_result.ok()?);
+                    }
+                    
+                    // 如果有统计数据，获取磁盘数据
+                    if !host_stats.is_empty() {
+                        // 获取该主机在时间范围内的所有磁盘数据
+                        let mut disks_stmt = conn.prepare(
+                            "SELECT timestamp, mount_point, disk_total, disk_used
+                             FROM disk_stats
+                             WHERE host_id = ? AND timestamp BETWEEN ? AND ?
+                             ORDER BY timestamp ASC, mount_point ASC"
+                        ).ok()?;
+                        
+                        let disks = disks_stmt.query_map(params![host_id, start_time, end_time], |row| {
+                            Ok(DiskRecord {
+                                timestamp: row.get(0)?,
+                                mount_point: row.get(1)?,
+                                total: row.get(2)?,
+                                used: row.get(3)?,
+                            })
+                        }).ok()?;
+                        
+                        // 将磁盘数据添加到对应的统计记录中
+                        let mut disk_records = Vec::new();
+                        for disk_result in disks {
+                            disk_records.push(disk_result.ok()?);
+                        }
+                        
+                        // 按时间戳将磁盘数据分配到对应的统计记录
+                        for stat in &mut host_stats {
+                            let stat_disks: Vec<_> = disk_records.iter()
+                                .filter(|disk| disk.timestamp == stat.timestamp)
+                                .cloned()
+                                .collect();
+                            
+                            stat.disks = stat_disks;
+                        }
+                    }
+                    
+                    result.insert(host_name, host_stats);
+                } else {
+                    // 需要聚合 - 计算窗口大小
+                    let window_size = ((end_time - start_time) as f64 / max_points as f64).ceil() as i64;
+                    
+                    // 使用SQL的窗口函数和分组聚合
+                    let mut stats_stmt = conn.prepare(
+                        "WITH windows AS (
+                            SELECT 
+                                (timestamp - ?) / ? AS window_id,
+                                AVG(timestamp) AS avg_timestamp,
+                                AVG(cpu_usage) AS avg_cpu,
+                                AVG(memory_total) AS avg_memory_total,
+                                AVG(memory_used) AS avg_memory_used,
+                                MAX(network_in) AS last_network_in,
+                                MAX(network_out) AS last_network_out,
+                                AVG(network_in_speed) AS avg_network_in_speed,
+                                AVG(network_out_speed) AS avg_network_out_speed,
+                                MAX(online) AS last_online
+                            FROM stats
+                            WHERE host_id = ? AND timestamp BETWEEN ? AND ?
+                            GROUP BY window_id
+                            ORDER BY window_id
+                        )
+                        SELECT 
+                            CAST(avg_timestamp AS INTEGER),
+                            avg_cpu,
+                            CAST(avg_memory_total AS INTEGER),
+                            CAST(avg_memory_used AS INTEGER),
+                            CAST(last_network_in AS INTEGER),
+                            CAST(last_network_out AS INTEGER),
+                            CAST(avg_network_in_speed AS INTEGER),
+                            CAST(avg_network_out_speed AS INTEGER),
+                            last_online
+                        FROM windows"
+                    ).ok()?;
+                    
+                    let stats = stats_stmt.query_map(params![start_time, window_size, host_id, start_time, end_time], |row| {
+                        Ok(HostStatRecord {
+                            timestamp: row.get(0)?,
+                            cpu: row.get(1)?,
+                            memory_total: row.get(2)?,
+                            memory_used: row.get(3)?,
+                            network_in: row.get(4)?,
+                            network_out: row.get(5)?,
+                            network_in_speed: row.get(6)?,
+                            network_out_speed: row.get(7)?,
+                            online: row.get(8)?,
+                            alias: host_alias.clone(),
+                            disks: Vec::new(),
+                        })
+                    }).ok()?;
+                    
+                    let mut host_stats = Vec::new();
+                    for stat_result in stats {
+                        host_stats.push(stat_result.ok()?);
+                    }
+                    
+                    // 为聚合后的数据点添加最近的磁盘数据
+                    // 获取所有唯一的挂载点
+                    let mut mount_points_stmt = conn.prepare(
+                        "SELECT DISTINCT mount_point FROM disk_stats WHERE host_id = ?"
+                    ).ok()?;
+                    
+                    let mount_points = mount_points_stmt.query_map(params![host_id], |row| {
+                        row.get::<_, String>(0)
+                    }).ok()?;
+                    
+                    let mut unique_mounts = Vec::new();
+                    for mp_result in mount_points {
+                        unique_mounts.push(mp_result.ok()?);
+                    }
+                    
+                    // 为每个聚合点找到每个挂载点的最近磁盘数据
+                    for stat in &mut host_stats {
+                        for mount_point in &unique_mounts {
+                            // 查找最接近当前时间戳的磁盘记录
+                            let mut closest_disk_stmt = conn.prepare(
+                                "SELECT timestamp, mount_point, disk_total, disk_used
+                                 FROM disk_stats
+                                 WHERE host_id = ? AND mount_point = ?
+                                 ORDER BY ABS(timestamp - ?) ASC
+                                 LIMIT 1"
+                            ).ok()?;
+                            
+                            if let Ok(disk) = closest_disk_stmt.query_row(params![host_id, mount_point, stat.timestamp], |row| {
+                                Ok(DiskRecord {
+                                    timestamp: row.get(0)?,
+                                    mount_point: row.get(1)?,
+                                    total: row.get(2)?,
+                                    used: row.get(3)?,
+                                })
+                            }) {
+                                stat.disks.push(disk);
+                            }
+                        }
+                    }
+                    
+                    result.insert(host_name, host_stats);
+                }
+            }
+            
+            Ok(result)
+        }).await??;
         
         Ok(result)
     }

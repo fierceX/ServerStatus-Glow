@@ -23,50 +23,48 @@ use crate::G_STATS_MGR;
 
 const KIND: &str = "http";
 
-pub async fn get_stats_json(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    // 检查是否有时间范围参数
-    if params.contains_key("start_time") || params.contains_key("end_time") {
-        // 获取时间范围参数
-        let now = chrono::Utc::now().timestamp();
-        let start_time = params
-            .get("start_time")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(now - 600); // 默认10分钟前
-        
-        let end_time = params
-            .get("end_time")
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(now);
-        
-        // 调用 StatsMgr 的方法获取指定时间范围的数据
-        match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
-            Ok(stats) => (
-                [(header::CONTENT_TYPE, "application/json")],
-                serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
-            ),
-            Err(e) => {
-                error!("Failed to get stats by timerange: {}", e);
-                (
-                    [(header::CONTENT_TYPE, "application/json")],
-                    json!({
-                        "error": format!("Failed to get stats: {}", e),
-                        "code": 500
-                    }).to_string(),
-                )
-            }
-        }
+// 修改为只返回实时数据
+pub async fn get_stats_json() -> impl IntoResponse {
+    // 只返回当前状态
+    if let Some(mgr) = G_STATS_MGR.get() {
+        let current_stats = mgr.get_stats_json();
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            current_stats,
+        )
     } else {
-        // 无参数时返回当前状态和近10分钟的历史数据
-        let now = chrono::Utc::now().timestamp();
-        let start_time = now - 600; // 10分钟前
-        
-        // 获取当前状态和历史数据
-        let current_stats = G_STATS_MGR.get().unwrap().get_stats_json();
-        
-        match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, now) {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "error": "Stats manager not initialized",
+                "code": 500
+            }).to_string(),
+        )
+    }
+}
+
+// 添加新的函数获取历史数据
+pub async fn get_history_stats(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
+    // 解析时间范围参数
+    let now = chrono::Utc::now().timestamp();
+    let start_time = params
+        .get("start_time")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(now - 600); // 默认10分钟前
+    
+    let end_time = params
+        .get("end_time")
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(now);
+    
+    // 获取历史数据
+    if let Some(mgr) = G_STATS_MGR.get() {
+        match mgr.get_stats_by_timerange(start_time, end_time) {
             Ok(mut history_stats) => {
-                // 将当前状态添加到历史数据中
-                // 注意：这里假设当前状态可以被解析为JSON对象
+                // 获取当前状态
+                let current_stats = mgr.get_stats_json();
+                
+                // 尝试将当前状态添加到历史数据中
                 if let Ok(current_json) = serde_json::from_str::<serde_json::Value>(&current_stats) {
                     // 合并当前状态和历史数据
                     if let Some(obj) = history_stats.as_object_mut() {
@@ -86,14 +84,24 @@ pub async fn get_stats_json(Query(params): Query<HashMap<String, String>>) -> im
                 }
             },
             Err(e) => {
-                error!("Failed to get historical stats: {}", e);
-                // 出错时至少返回当前状态
+                error!("Failed to get stats by timerange: {}", e);
                 (
                     [(header::CONTENT_TYPE, "application/json")],
-                    current_stats,
+                    json!({
+                        "error": format!("Failed to get stats: {}", e),
+                        "code": 500
+                    }).to_string(),
                 )
             }
         }
+    } else {
+        (
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "error": "Stats manager not initialized",
+                "code": 500
+            }).to_string(),
+        )
     }
 }
 
@@ -103,48 +111,6 @@ pub async fn get_site_config_json() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/json")], "{}")
 }
 
-pub async fn admin_api(_claims: jwt::Claims, Path(path): Path<String>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
-    match path.as_str() {
-        "stats.json" => {
-            // 检查是否有时间范围参数
-            if params.contains_key("start_time") || params.contains_key("end_time") {
-                let now = chrono::Utc::now().timestamp();
-                let start_time = params
-                    .get("start_time")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(now - 600); // 默认10分钟前
-                
-                let end_time = params
-                    .get("end_time")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(now);
-                
-                match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
-                    Ok(stats) => return Json(stats),
-                    Err(e) => {
-                        error!("Failed to get stats by timerange: {}", e);
-                        return Json(json!({
-                            "error": format!("Failed to get stats: {}", e),
-                            "code": 500
-                        }));
-                    }
-                }
-            } else {
-                let resp = G_STATS_MGR.get().unwrap().get_all_info().unwrap();
-                return Json(resp);
-            }
-        }
-        "config.json" => {
-            let resp = G_CONFIG.get().unwrap().to_json_value().unwrap();
-            return Json(resp);
-        }
-        _ => {
-            //
-        }
-    }
-
-    Json(json!({ "code": 0, "message": "ok" }))
-}
 
 pub fn init_jinja_tpl() -> Result<(), anyhow::Error> {
     let detail_data = Asset::get("/jinja/detail.jinja.html").expect("detail.jinja.html not found");

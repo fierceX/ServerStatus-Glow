@@ -368,45 +368,17 @@ impl StatsMgr {
     pub fn get_stats_json(&self) -> String {
         self.resp_json.lock().unwrap().to_string()
     }
-
-    pub fn report(&self, data: serde_json::Value) -> Result<()> {
-        lazy_static! {
-            static ref SENDER: SyncSender<Cow<'static, HostStat>> = STAT_SENDER.get().unwrap().clone();
-        }
-
-        match serde_json::from_value(data) {
-            Ok(stat) => {
-                trace!("send stat => {:?} ", stat);
-                SENDER.send(Cow::Owned(stat));
-            }
-            Err(err) => {
-                error!("report error => {:?}", err);
-            }
-        };
-        Ok(())
-    }
-
-    pub fn get_all_info(&self) -> Result<serde_json::Value> {
-        let data = self.stats_data.lock().unwrap();
-        let mut resp_json = serde_json::to_value(&*data)?;
-        // for skip_serializing
-        if let Some(srv_list) = resp_json["servers"].as_array_mut() {
-            for (idx, stat) in data.servers.iter().enumerate() {
-                if let Some(srv) = srv_list[idx].as_object_mut() {
-                    srv.insert("ip_info".into(), serde_json::to_value(stat.ip_info.as_ref())?);
-                    srv.insert("sys_info".into(), serde_json::to_value(stat.sys_info.as_ref())?);
-                    if !stat.disks.is_empty() {
-                        srv.insert("disks".into(), serde_json::to_value(&stat.disks)?);
-                    }
-                }
-            }
-        }
-        Ok(resp_json)
-    }
     
-    // 在 StatsMgr 实现中添加
-    pub fn get_stats_by_timerange(&self, start_time: i64, end_time: i64) -> Result<serde_json::Value> {
-        let stats = self.db.get_stats_by_timerange(start_time, end_time)?;
+    // 添加异步方法获取历史数据
+    pub async fn get_stats_by_timerange_async(&self, start_time: i64, end_time: i64) -> Result<serde_json::Value> {
+        // 创建一个线程安全的数据库引用
+        let db = self.db.clone();
+        
+        // 使用 tokio 的 spawn_blocking 在单独的线程中执行数据库查询
+        // 这样可以避免阻塞异步运行时
+        let stats = tokio::task::spawn_blocking(move || {
+            db.get_stats_by_timerange(start_time, end_time)
+        }).await??;
         
         let mut result = serde_json::json!({
             "updated": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
@@ -521,5 +493,40 @@ impl StatsMgr {
         }
         
         Ok(result)
+    }
+
+    pub fn report(&self, data: serde_json::Value) -> Result<()> {
+        lazy_static! {
+            static ref SENDER: SyncSender<Cow<'static, HostStat>> = STAT_SENDER.get().unwrap().clone();
+        }
+
+        match serde_json::from_value(data) {
+            Ok(stat) => {
+                trace!("send stat => {:?} ", stat);
+                SENDER.send(Cow::Owned(stat));
+            }
+            Err(err) => {
+                error!("report error => {:?}", err);
+            }
+        };
+        Ok(())
+    }
+
+    pub fn get_all_info(&self) -> Result<serde_json::Value> {
+        let data = self.stats_data.lock().unwrap();
+        let mut resp_json = serde_json::to_value(&*data)?;
+        // for skip_serializing
+        if let Some(srv_list) = resp_json["servers"].as_array_mut() {
+            for (idx, stat) in data.servers.iter().enumerate() {
+                if let Some(srv) = srv_list[idx].as_object_mut() {
+                    srv.insert("ip_info".into(), serde_json::to_value(stat.ip_info.as_ref())?);
+                    srv.insert("sys_info".into(), serde_json::to_value(stat.sys_info.as_ref())?);
+                    if !stat.disks.is_empty() {
+                        srv.insert("disks".into(), serde_json::to_value(&stat.disks)?);
+                    }
+                }
+            }
+        }
+        Ok(resp_json)
     }
 }
