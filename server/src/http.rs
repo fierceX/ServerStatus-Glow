@@ -35,31 +35,61 @@ pub async fn get_stats_json() -> impl IntoResponse {
 }
 
 // 修改后的接口：接收参数，返回历史数据
+use once_cell::sync::OnceCell;
+use tokio::runtime::Runtime;
+
+// 添加全局变量存储历史数据处理线程池
+static HISTORY_RUNTIME: OnceCell<Runtime> = OnceCell::new();
+
+// 初始化历史数据处理线程池
+pub fn init_history_runtime(runtime: Runtime) -> Result<(), Runtime> {
+    HISTORY_RUNTIME.set(runtime)
+}
+
+// 在历史数据查询函数中使用专用线程池
 pub async fn get_history_stats(Query(params): Query<HashMap<String, String>>) -> impl IntoResponse {
-    // 获取时间范围参数
-    let now = chrono::Utc::now().timestamp();
-    let start_time = params
-        .get("start_time")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(now - 600); // 默认10分钟前
+    let params_clone = params.clone();
     
-    let end_time = params
-        .get("end_time")
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(now);
+    // 使用专用线程池处理历史数据查询
+    let handle: JoinHandle<([(header::HeaderName, &'static str); 1], String)> = 
+        HISTORY_RUNTIME.get().unwrap().spawn(async move {
+            let now = chrono::Utc::now().timestamp();
+            let start_time = params_clone
+                .get("start_time")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(now - 600);
+            
+            let end_time = params_clone
+                .get("end_time")
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(now);
+            
+            match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
+                Ok(stats) => (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
+                ),
+                Err(e) => {
+                    error!("Failed to get stats by timerange: {}", e);
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        json!({
+                            "error": format!("Failed to get stats: {}", e),
+                            "code": 500
+                        }).to_string(),
+                    )
+                }
+            }
+        });
     
-    // 调用 StatsMgr 的方法获取指定时间范围的数据
-    match G_STATS_MGR.get().unwrap().get_stats_by_timerange(start_time, end_time) {
-        Ok(stats) => (
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::to_string(&stats).unwrap_or_else(|_| "{}".to_string()),
-        ),
+    match handle.await {
+        Ok(response) => response,
         Err(e) => {
-            error!("Failed to get stats by timerange: {}", e);
+            error!("Thread error: {:?}", e);
             (
                 [(header::CONTENT_TYPE, "application/json")],
                 json!({
-                    "error": format!("Failed to get stats: {}", e),
+                    "error": "Internal server error",
                     "code": 500
                 }).to_string(),
             )

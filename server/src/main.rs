@@ -16,6 +16,9 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio::signal;
+use tokio::task::JoinHandle;
+// 添加导入
+use tokio::runtime::Builder;
 
 use axum::{
     http::{Method, Uri},
@@ -102,6 +105,7 @@ pub async fn shutdown_signal() {
     println!("signal received, starting graceful shutdown");
 }
 
+// 在 main 函数中初始化专用线程池
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
@@ -179,6 +183,26 @@ async fn main() -> Result<(), anyhow::Error> {
     mgr.init(G_CONFIG.get().unwrap(), notifies)?;
     if G_STATS_MGR.set(mgr).is_err() {
         error!("can't set G_STATS_MGR");
+        process::exit(1);
+    }
+
+    // serv grpc
+    tokio::spawn(async move { grpc::serv_grpc(cfg).await });
+
+    let http_addr = cfg.http_addr.to_string();
+    eprintln!("🚀 listening on http://{http_addr}");
+
+    // 创建专用于处理历史数据的线程池
+    let history_runtime = Builder::new_multi_thread()
+        .worker_threads(4)  // 可以根据需要调整线程数
+        .thread_name("history-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    
+    // 将线程池存储在全局变量中
+    if crate::http::init_history_runtime(history_runtime).is_err() {
+        error!("can't set history runtime");
         process::exit(1);
     }
 
