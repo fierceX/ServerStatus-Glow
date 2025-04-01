@@ -18,6 +18,15 @@ impl Database {
         
         let conn = Connection::open(db_path)?;
         
+        // 开启 WAL 模式和其他性能优化
+        conn.execute_batch("
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = 1000;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA mmap_size = 30000000000;
+        ")?;
+        
         if need_init {
             Self::init_db(&conn)?;
         }
@@ -134,6 +143,7 @@ impl Database {
             [],
         )?;
         
+        // 优化索引 - 添加更多索引以加速查询
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_stats_host_time ON stats(host_id, timestamp)",
             [],
@@ -141,6 +151,16 @@ impl Database {
         
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_disk_stats_host_time ON disk_stats(host_id, timestamp)",
+            [],
+        )?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_timestamp ON stats(timestamp)",
+            [],
+        )?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_disk_stats_timestamp ON disk_stats(timestamp)",
             [],
         )?;
         
@@ -193,25 +213,26 @@ impl Database {
             ],
         )?;
         
-        // 保存每个磁盘的数据
+        // 保存每个磁盘的数据 - 使用预处理语句
         if !stat.disks.is_empty() {
+            let mut disk_stmt = tx.prepare(
+                "INSERT INTO disk_stats (
+                    host_id, timestamp, mount_point, disk_total, disk_used
+                ) VALUES (?, ?, ?, ?, ?)"
+            )?;
+            
             for disk in &stat.disks {
-                tx.execute(
-                    "INSERT INTO disk_stats (
-                        host_id, timestamp, mount_point, disk_total, disk_used
-                    ) VALUES (?, ?, ?, ?, ?)",
-                    params![
-                        host_id,
-                        timestamp,
-                        disk.mount_point,
-                        disk.total,
-                        disk.used
-                    ],
-                )?;
+                disk_stmt.execute(params![
+                    host_id,
+                    timestamp,
+                    disk.mount_point,
+                    disk.total,
+                    disk.used
+                ])?;
             }
         }
         
-        // 提交事务 - 修改：无论是否有磁盘数据都提交事务
+        // 提交事务
         tx.commit()?;
         
         Ok(())
@@ -267,7 +288,7 @@ impl Database {
             let (host_id, host_name, host_alias) = host_result?;
             
             // 计算需要的时间窗口大小
-            let mut count_stmt = conn.prepare(  // 修改：添加 mut 关键字
+            let mut count_stmt = conn.prepare(
                 "SELECT COUNT(*) FROM stats 
                  WHERE host_id = ? AND timestamp BETWEEN ? AND ?"
             )?;
@@ -276,16 +297,17 @@ impl Database {
             
             // 如果数据点少于max_points，不需要聚合
             if count <= max_points as i64 {
-                // 使用原始查询
+                // 使用原始查询 - 添加LIMIT以防止返回过多数据
                 let mut stats_stmt = conn.prepare(
                     "SELECT timestamp, cpu_usage, memory_total, memory_used, 
                             network_in, network_out, network_in_speed, network_out_speed, online
                      FROM stats
                      WHERE host_id = ? AND timestamp BETWEEN ? AND ?
-                     ORDER BY timestamp ASC"
+                     ORDER BY timestamp ASC
+                     LIMIT ?"
                 )?;
                 
-                let stats = stats_stmt.query_map(params![host_id, start_time, end_time], |row| {
+                let stats = stats_stmt.query_map(params![host_id, start_time, end_time, max_points], |row| {
                     Ok(HostStatRecord {
                         timestamp: row.get(0)?,
                         cpu: row.get(1)?,
@@ -318,7 +340,7 @@ impl Database {
                     
                     let disks = disks_stmt.query_map(params![host_id, start_time, end_time], |row| {
                         Ok(DiskRecord {
-                            timestamp: row.get(0)?,  // 正确使用 timestamp 字段
+                            timestamp: row.get(0)?,
                             mount_point: row.get(1)?,
                             total: row.get(2)?,
                             used: row.get(3)?,
@@ -365,6 +387,7 @@ impl Database {
                         WHERE host_id = ? AND timestamp BETWEEN ? AND ?
                         GROUP BY window_id
                         ORDER BY window_id
+                        LIMIT ?
                     )
                     SELECT 
                         CAST(avg_timestamp AS INTEGER),
@@ -379,7 +402,7 @@ impl Database {
                     FROM windows"
                 )?;
                 
-                let stats = stats_stmt.query_map(params![start_time, window_size, host_id, start_time, end_time], |row| {
+                let stats = stats_stmt.query_map(params![start_time, window_size, host_id, start_time, end_time, max_points], |row| {
                     Ok(HostStatRecord {
                         timestamp: row.get(0)?,
                         cpu: row.get(1)?,
@@ -447,6 +470,43 @@ impl Database {
         Ok(result)
     }
     
+    // 添加清理旧数据的方法
+    pub fn cleanup_old_data(&self, retention_days: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().timestamp();
+        let cutoff_time = now - (retention_days * 24 * 60 * 60);
+        
+        let tx = conn.transaction()?;
+        
+        // 删除旧的统计数据
+        let stats_deleted = tx.execute(
+            "DELETE FROM stats WHERE timestamp < ?",
+            params![cutoff_time],
+        )?;
+        
+        // 删除旧的磁盘数据
+        let disks_deleted = tx.execute(
+            "DELETE FROM disk_stats WHERE timestamp < ?",
+            params![cutoff_time],
+        )?;
+        
+        tx.commit()?;
+        
+        Ok(stats_deleted + disks_deleted)
+    }
+    
+    // 添加数据库优化方法
+    pub fn optimize(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        
+        // 运行VACUUM来整理数据库文件
+        conn.execute_batch("VACUUM")?;
+        
+        // 分析表以优化查询计划
+        conn.execute_batch("ANALYZE")?;
+        
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
