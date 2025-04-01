@@ -61,6 +61,7 @@ fn create_app_router() -> Router {
     Router::new()
         .route("/report", post(http::report))
         .route("/json/stats.json", get(http::get_stats_json)) // 兼容就旧主题
+        .route("/json/history.json", get(http::get_history_stats)) // 兼容就旧主题
         // .route("/config.pub.json", get(http::get_site_config_json)) // TODO
         .route("/api/admin/authorize", post(jwt::authorize))
         .route("/api/admin/:path", get(http::admin_api)) // stats.json || config.json
