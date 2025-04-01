@@ -188,7 +188,8 @@ impl Database {
         
         // 确保主机存在
         let host_id = self.ensure_host_exists(&conn, stat)?;
-        let timestamp = Utc::now().timestamp();
+        // let timestamp = Utc::now().timestamp();
+        let timestamp = stat.latest_ts.unwrap_or_else(|| Utc::now().timestamp());
         
         // 开始事务
         let tx = conn.transaction()?;
