@@ -206,11 +206,13 @@ async fn main() -> Result<(), anyhow::Error> {
         process::exit(1);
     }
 
+    // 注意：这里有重复的代码，需要删除下面的重复部分
     // serv grpc
-    tokio::spawn(async move { grpc::serv_grpc(cfg).await });
-
-    let http_addr = cfg.http_addr.to_string();
-    eprintln!("🚀 listening on http://{http_addr}");
+    // tokio::spawn(async move { grpc::serv_grpc(cfg).await });
+    
+    // let http_addr = cfg.http_addr.to_string();
+    // eprintln!("🚀 listening on http://{http_addr}");
+    // 重复代码结束
 
     let listener = TcpListener::bind(&http_addr).await.unwrap();
     axum::serve(listener, create_app_router())
