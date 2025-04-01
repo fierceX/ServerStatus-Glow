@@ -209,10 +209,10 @@ impl Database {
                     ],
                 )?;
             }
-            
-            // 提交事务
-            tx.commit()?;
         }
+        
+        // 提交事务 - 修改：无论是否有磁盘数据都提交事务
+        tx.commit()?;
         
         Ok(())
     }
@@ -267,7 +267,7 @@ impl Database {
             let (host_id, host_name, host_alias) = host_result?;
             
             // 计算需要的时间窗口大小
-            let count_stmt = conn.prepare(
+            let mut count_stmt = conn.prepare(  // 修改：添加 mut 关键字
                 "SELECT COUNT(*) FROM stats 
                  WHERE host_id = ? AND timestamp BETWEEN ? AND ?"
             )?;
