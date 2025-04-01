@@ -260,72 +260,184 @@ impl Database {
             ))
         })?;
         
+        // 最大数据点数量，默认600
+        let max_points = 600;
+        
         for host_result in hosts {
             let (host_id, host_name, host_alias) = host_result?;
             
-            // 获取该主机在时间范围内的所有统计数据
-            let mut stats_stmt = conn.prepare(
-                "SELECT timestamp, cpu_usage, memory_total, memory_used, 
-                        network_in, network_out, network_in_speed, network_out_speed, online
-                 FROM stats
-                 WHERE host_id = ? AND timestamp BETWEEN ? AND ?
-                 ORDER BY timestamp ASC"
+            // 计算需要的时间窗口大小
+            let count_stmt = conn.prepare(
+                "SELECT COUNT(*) FROM stats 
+                 WHERE host_id = ? AND timestamp BETWEEN ? AND ?"
             )?;
             
-            let stats = stats_stmt.query_map(params![host_id, start_time, end_time], |row| {
-                Ok(HostStatRecord {
-                    timestamp: row.get(0)?,
-                    cpu: row.get(1)?,
-                    memory_total: row.get(2)?,
-                    memory_used: row.get(3)?,
-                    network_in: row.get(4)?,
-                    network_out: row.get(5)?,
-                    network_in_speed: row.get(6)?,
-                    network_out_speed: row.get(7)?,
-                    online: row.get(8)?,
-                    alias: host_alias.clone(),
-                    disks: Vec::new(), // 先创建空的磁盘列表
-                })
-            })?;
+            let count: i64 = count_stmt.query_row(params![host_id, start_time, end_time], |row| row.get(0))?;
             
-            let mut host_stats = Vec::new();
-            for stat_result in stats {
-                host_stats.push(stat_result?);
-            }
-            
-            // 如果有统计数据，获取磁盘数据
-            if !host_stats.is_empty() {
-                // 获取该主机在时间范围内的所有磁盘数据
-                let mut disks_stmt = conn.prepare(
-                    "SELECT timestamp, mount_point, disk_total, disk_used
-                     FROM disk_stats
+            // 如果数据点少于max_points，不需要聚合
+            if count <= max_points as i64 {
+                // 使用原始查询
+                let mut stats_stmt = conn.prepare(
+                    "SELECT timestamp, cpu_usage, memory_total, memory_used, 
+                            network_in, network_out, network_in_speed, network_out_speed, online
+                     FROM stats
                      WHERE host_id = ? AND timestamp BETWEEN ? AND ?
-                     ORDER BY timestamp ASC, mount_point ASC"
+                     ORDER BY timestamp ASC"
                 )?;
                 
-                let disks = disks_stmt.query_map(params![host_id, start_time, end_time], |row| {
-                    Ok(DiskRecord {
-                        timestamp: row.get(0)?,  // 正确使用 timestamp 字段
-                        mount_point: row.get(1)?,
-                        total: row.get(2)?,
-                        used: row.get(3)?,
+                let stats = stats_stmt.query_map(params![host_id, start_time, end_time], |row| {
+                    Ok(HostStatRecord {
+                        timestamp: row.get(0)?,
+                        cpu: row.get(1)?,
+                        memory_total: row.get(2)?,
+                        memory_used: row.get(3)?,
+                        network_in: row.get(4)?,
+                        network_out: row.get(5)?,
+                        network_in_speed: row.get(6)?,
+                        network_out_speed: row.get(7)?,
+                        online: row.get(8)?,
+                        alias: host_alias.clone(),
+                        disks: Vec::new(),
                     })
                 })?;
                 
-                // 将磁盘数据添加到对应的统计记录中
-                let mut disk_records = Vec::new();
-                for disk_result in disks {
-                    disk_records.push(disk_result?);
+                let mut host_stats = Vec::new();
+                for stat_result in stats {
+                    host_stats.push(stat_result?);
                 }
                 
-                // 按时间戳将磁盘数据分配到对应的统计记录
-                for stat in &mut host_stats {
-                    let stat_disks: Vec<_> = disk_records.iter()
-                        .filter(|disk| disk.timestamp == stat.timestamp)
-                        .cloned()
-                        .collect();
+                // 如果有统计数据，获取磁盘数据
+                if !host_stats.is_empty() {
+                    // 获取该主机在时间范围内的所有磁盘数据
+                    let mut disks_stmt = conn.prepare(
+                        "SELECT timestamp, mount_point, disk_total, disk_used
+                         FROM disk_stats
+                         WHERE host_id = ? AND timestamp BETWEEN ? AND ?
+                         ORDER BY timestamp ASC, mount_point ASC"
+                    )?;
                     
-                    stat.disks = stat_disks;
+                    let disks = disks_stmt.query_map(params![host_id, start_time, end_time], |row| {
+                        Ok(DiskRecord {
+                            timestamp: row.get(0)?,  // 正确使用 timestamp 字段
+                            mount_point: row.get(1)?,
+                            total: row.get(2)?,
+                            used: row.get(3)?,
+                        })
+                    })?;
+                    
+                    // 将磁盘数据添加到对应的统计记录中
+                    let mut disk_records = Vec::new();
+                    for disk_result in disks {
+                        disk_records.push(disk_result?);
+                    }
+                    
+                    // 按时间戳将磁盘数据分配到对应的统计记录
+                    for stat in &mut host_stats {
+                        let stat_disks: Vec<_> = disk_records.iter()
+                            .filter(|disk| disk.timestamp == stat.timestamp)
+                            .cloned()
+                            .collect();
+                        
+                        stat.disks = stat_disks;
+                    }
+                }
+                
+                result.insert(host_name, host_stats);
+            } else {
+                // 需要聚合 - 计算窗口大小
+                let window_size = ((end_time - start_time) as f64 / max_points as f64).ceil() as i64;
+                
+                // 使用SQL的窗口函数和分组聚合
+                let mut stats_stmt = conn.prepare(
+                    "WITH windows AS (
+                        SELECT 
+                            (timestamp - ?) / ? AS window_id,
+                            AVG(timestamp) AS avg_timestamp,
+                            AVG(cpu_usage) AS avg_cpu,
+                            AVG(memory_total) AS avg_memory_total,
+                            AVG(memory_used) AS avg_memory_used,
+                            MAX(network_in) AS last_network_in,
+                            MAX(network_out) AS last_network_out,
+                            AVG(network_in_speed) AS avg_network_in_speed,
+                            AVG(network_out_speed) AS avg_network_out_speed,
+                            MAX(online) AS last_online
+                        FROM stats
+                        WHERE host_id = ? AND timestamp BETWEEN ? AND ?
+                        GROUP BY window_id
+                        ORDER BY window_id
+                    )
+                    SELECT 
+                        CAST(avg_timestamp AS INTEGER),
+                        avg_cpu,
+                        CAST(avg_memory_total AS INTEGER),
+                        CAST(avg_memory_used AS INTEGER),
+                        CAST(last_network_in AS INTEGER),
+                        CAST(last_network_out AS INTEGER),
+                        CAST(avg_network_in_speed AS INTEGER),
+                        CAST(avg_network_out_speed AS INTEGER),
+                        last_online
+                    FROM windows"
+                )?;
+                
+                let stats = stats_stmt.query_map(params![start_time, window_size, host_id, start_time, end_time], |row| {
+                    Ok(HostStatRecord {
+                        timestamp: row.get(0)?,
+                        cpu: row.get(1)?,
+                        memory_total: row.get(2)?,
+                        memory_used: row.get(3)?,
+                        network_in: row.get(4)?,
+                        network_out: row.get(5)?,
+                        network_in_speed: row.get(6)?,
+                        network_out_speed: row.get(7)?,
+                        online: row.get(8)?,
+                        alias: host_alias.clone(),
+                        disks: Vec::new(),
+                    })
+                })?;
+                
+                let mut host_stats = Vec::new();
+                for stat_result in stats {
+                    host_stats.push(stat_result?);
+                }
+                
+                // 为聚合后的数据点添加最近的磁盘数据
+                // 获取所有唯一的挂载点
+                let mut mount_points_stmt = conn.prepare(
+                    "SELECT DISTINCT mount_point FROM disk_stats WHERE host_id = ?"
+                )?;
+                
+                let mount_points = mount_points_stmt.query_map(params![host_id], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                
+                let mut unique_mounts = Vec::new();
+                for mp_result in mount_points {
+                    unique_mounts.push(mp_result?);
+                }
+                
+                // 为每个聚合点找到每个挂载点的最近磁盘数据
+                for stat in &mut host_stats {
+                    for mount_point in &unique_mounts {
+                        // 查找最接近当前时间戳的磁盘记录
+                        let mut closest_disk_stmt = conn.prepare(
+                            "SELECT timestamp, mount_point, disk_total, disk_used
+                             FROM disk_stats
+                             WHERE host_id = ? AND mount_point = ?
+                             ORDER BY ABS(timestamp - ?) ASC
+                             LIMIT 1"
+                        )?;
+                        
+                        if let Ok(disk) = closest_disk_stmt.query_row(params![host_id, mount_point, stat.timestamp], |row| {
+                            Ok(DiskRecord {
+                                timestamp: row.get(0)?,
+                                mount_point: row.get(1)?,
+                                total: row.get(2)?,
+                                used: row.get(3)?,
+                            })
+                        }) {
+                            stat.disks.push(disk);
+                        }
+                    }
                 }
                 
                 result.insert(host_name, host_stats);
