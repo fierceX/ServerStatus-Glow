@@ -223,7 +223,7 @@ impl Database {
             for disk in &stat.disks {
                 disk_stmt.execute(params![
                     host_id,
-                    timestamp,
+                    stat.latest_ts,
                     disk.mount_point,
                     disk.total,
                     disk.used
