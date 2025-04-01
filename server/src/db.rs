@@ -188,8 +188,6 @@ impl Database {
         
         // 确保主机存在
         let host_id = self.ensure_host_exists(&conn, stat)?;
-        // let timestamp = Utc::now().timestamp();
-        let timestamp = stat.latest_ts.unwrap_or_else(|| Utc::now().timestamp());
         
         // 开始事务
         let tx = conn.transaction()?;
@@ -202,7 +200,7 @@ impl Database {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 host_id,
-                timestamp,
+                stat.latest_ts,
                 stat.cpu,
                 stat.memory_total,
                 stat.memory_used,
