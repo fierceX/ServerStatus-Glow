@@ -509,12 +509,14 @@ impl Database {
     }
     
     pub fn aggregate_data(&self, interval_minutes: i64) -> Result<()> {
-        let mut conn = self.conn.lock().unwrap();
-        let tx = conn.transaction()?;
-        
+        // let mut conn = self.conn.lock().unwrap();
+        // let tx = conn.transaction()?;
+        let mut conn1 = self.conn.lock().unwrap();
+        let conn = self.conn.lock().unwrap();
+        let tx: rusqlite::Transaction<'_> = conn1.transaction()?;
         // 获取最新的聚合时间戳
         let last_agg_time: Option<i64> = {
-            let mut stmt = tx.prepare(
+            let mut stmt = conn.prepare(
                 "SELECT MAX(timestamp) FROM aggregated_stats WHERE interval_minutes = ?"
             )?;
             stmt.query_row(params![interval_minutes], |row| row.get(0)).ok()
@@ -524,7 +526,7 @@ impl Database {
         let start_time = if let Some(time) = last_agg_time {
             time
         } else {
-            let mut stmt = tx.prepare("SELECT MIN(timestamp) FROM stats")?;
+            let mut stmt = conn.prepare("SELECT MIN(timestamp) FROM stats")?;
             stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0)
         };
         
@@ -540,7 +542,7 @@ impl Database {
         
         // 获取所有主机
         let hosts: Vec<(i64, String)> = {
-            let mut hosts_stmt = tx.prepare("SELECT id, name FROM hosts")?;
+            let mut hosts_stmt = conn.prepare("SELECT id, name FROM hosts")?;
             let hosts_iter = hosts_stmt.query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })?;
@@ -560,7 +562,7 @@ impl Database {
                 
                 // 聚合主机统计数据
                 let row_opt = {
-                    let mut agg_stmt = tx.prepare(
+                    let mut agg_stmt = conn.prepare(
                         "SELECT 
                             AVG(cpu_usage) as avg_cpu,
                             AVG(memory_total) as avg_memory_total,
@@ -615,7 +617,7 @@ impl Database {
                     }
                     
                     // 聚合磁盘数据 - 按挂载点分组
-                    let mut disk_stmt = tx.prepare(
+                    let mut disk_stmt = conn.prepare(
                         "SELECT 
                             mount_point,
                             AVG(disk_total) as avg_total,
