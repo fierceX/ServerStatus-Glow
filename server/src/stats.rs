@@ -147,8 +147,8 @@ impl StatsMgr {
                             stat_t.alias = info.alias.to_owned();
                         }
 
-                        info.latest_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                        stat_t.latest_ts = info.latest_ts;
+                        // info.latest_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                        // stat_t.latest_ts = info.latest_ts;
 
                         // last_network_in/out
                         if !stat_t.vnstat {
