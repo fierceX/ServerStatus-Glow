@@ -509,27 +509,24 @@ impl Database {
     }
     
     pub fn aggregate_data(&self, interval_minutes: i64) -> Result<()> {
-        // let mut conn = self.conn.lock().unwrap();
-        // let tx = conn.transaction()?;
-        let mut conn1 = self.conn.lock().unwrap();
-        let conn = self.conn.lock().unwrap();
-        let tx: rusqlite::Transaction<'_> = conn1.transaction()?;
-        // 获取最新的聚合时间戳
+        let mut conn = self.conn.lock().unwrap();
+        
+        // 获取最新的聚合时间戳 - 使用conn查询
         let last_agg_time: Option<i64> = {
             let mut stmt = conn.prepare(
                 "SELECT MAX(timestamp) FROM aggregated_stats WHERE interval_minutes = ?"
             )?;
             stmt.query_row(params![interval_minutes], |row| row.get(0)).ok()
-        };  // 使用代码块限制 stmt 的作用域
+        };
         
-        // 如果没有聚合记录，从最早的数据开始
+        // 如果没有聚合记录，从最早的数据开始 - 使用conn查询
         let start_time = if let Some(time) = last_agg_time {
             time
         } else {
             let mut stmt = conn.prepare("SELECT MIN(timestamp) FROM stats")?;
             stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0)
         };
-        
+    
         // 计算当前时间对齐到interval_minutes的时间点
         let now = Utc::now().timestamp();
         let interval_seconds = interval_minutes * 60;
@@ -540,7 +537,7 @@ impl Database {
             return Ok(());
         }
         
-        // 获取所有主机
+        // 获取所有主机 - 使用conn查询
         let hosts: Vec<(i64, String)> = {
             let mut hosts_stmt = conn.prepare("SELECT id, name FROM hosts")?;
             let hosts_iter = hosts_stmt.query_map([], |row| {
@@ -552,15 +549,18 @@ impl Database {
                 result.push(host_result?);
             }
             result
-        };  // 使用代码块限制 hosts_stmt 的作用域
+        };
+    
+        // 第一阶段：收集所有需要聚合的数据
+        let mut aggregated_data = Vec::new();
+        let mut aggregated_disk_data = Vec::new();
         
         for (host_id, _host_name) in hosts {
-            // 按interval_minutes聚合数据
             let mut current_time = start_time;
             while current_time < end_time {
                 let period_end = current_time + interval_seconds;
                 
-                // 聚合主机统计数据
+                // 聚合主机统计数据 - 使用conn查询
                 let row_opt = {
                     let mut agg_stmt = conn.prepare(
                         "SELECT 
@@ -588,35 +588,26 @@ impl Database {
                             row.get::<_, Option<bool>>(7)?,
                         ))
                     }).ok()
-                };  // 使用代码块限制 agg_stmt 的作用域
+                };
                 
                 if let Some((cpu, mem_total, mem_used, net_in, net_out, in_speed, out_speed, online)) = row_opt {
-                    // 只有当有数据时才插入聚合记录
                     if cpu.is_some() || mem_total.is_some() {
-                        // 使用 INSERT OR REPLACE 处理可能的重复
-                        tx.execute(
-                            "INSERT OR REPLACE INTO aggregated_stats (
-                                host_id, timestamp, interval_minutes, cpu_usage, 
-                                memory_total, memory_used, network_in, network_out,
-                                network_in_speed, network_out_speed, online
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            params![
-                                host_id,
-                                current_time,
-                                interval_minutes,
-                                cpu.unwrap_or(0.0),
-                                mem_total.unwrap_or(0),
-                                mem_used.unwrap_or(0),
-                                net_in.unwrap_or(0),
-                                net_out.unwrap_or(0),
-                                in_speed.unwrap_or(0),
-                                out_speed.unwrap_or(0),
-                                online.unwrap_or(false)
-                            ],
-                        )?;
+                        aggregated_data.push((
+                            host_id,
+                            current_time,
+                            interval_minutes,
+                            cpu.unwrap_or(0.0),
+                            mem_total.unwrap_or(0),
+                            mem_used.unwrap_or(0),
+                            net_in.unwrap_or(0),
+                            net_out.unwrap_or(0),
+                            in_speed.unwrap_or(0),
+                            out_speed.unwrap_or(0),
+                            online.unwrap_or(false),
+                        ));
                     }
                     
-                    // 聚合磁盘数据 - 按挂载点分组
+                    // 聚合磁盘数据 - 使用conn查询
                     let mut disk_stmt = conn.prepare(
                         "SELECT 
                             mount_point,
@@ -637,25 +628,63 @@ impl Database {
                     
                     for disk_result in disks {
                         let (mount_point, total, used) = disk_result?;
-                        
-                        tx.execute(
-                            "INSERT OR REPLACE INTO aggregated_disk_stats (
-                                host_id, timestamp, interval_minutes, mount_point, disk_total, disk_used
-                            ) VALUES (?, ?, ?, ?, ?, ?)",
-                            params![
-                                host_id,
-                                current_time,
-                                interval_minutes,
-                                mount_point,
-                                total,
-                                used
-                            ],
-                        )?;
+                        aggregated_disk_data.push((
+                            host_id,
+                            current_time,
+                            interval_minutes,
+                            mount_point,
+                            total,
+                            used,
+                        ));
                     }
                 }
                 
                 current_time = period_end;
             }
+        }
+    
+        // 第二阶段：开始事务并写入所有聚合数据
+        let tx = conn.transaction()?;
+        
+        // 写入主机聚合数据
+        for (host_id, timestamp, interval, cpu, mem_total, mem_used, net_in, net_out, in_speed, out_speed, online) in aggregated_data {
+            tx.execute(
+                "INSERT OR REPLACE INTO aggregated_stats (
+                    host_id, timestamp, interval_minutes, cpu_usage, 
+                    memory_total, memory_used, network_in, network_out,
+                    network_in_speed, network_out_speed, online
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    host_id,
+                    timestamp,
+                    interval,
+                    cpu,
+                    mem_total,
+                    mem_used,
+                    net_in,
+                    net_out,
+                    in_speed,
+                    out_speed,
+                    online
+                ],
+            )?;
+        }
+        
+        // 写入磁盘聚合数据
+        for (host_id, timestamp, interval, mount_point, total, used) in aggregated_disk_data {
+            tx.execute(
+                "INSERT OR REPLACE INTO aggregated_disk_stats (
+                    host_id, timestamp, interval_minutes, mount_point, disk_total, disk_used
+                ) VALUES (?, ?, ?, ?, ?, ?)",
+                params![
+                    host_id,
+                    timestamp,
+                    interval,
+                    mount_point,
+                    total,
+                    used
+                ],
+            )?;
         }
         
         tx.commit()?;
