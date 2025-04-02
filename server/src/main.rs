@@ -18,6 +18,7 @@ use tokio::runtime::Handle;
 use tokio::signal;
 // 添加导入
 use tokio::runtime::Builder;
+use tokio::time;
 
 use axum::{
     http::{Method, Uri},
@@ -184,6 +185,18 @@ async fn main() -> Result<(), anyhow::Error> {
         error!("can't set G_STATS_MGR");
         process::exit(1);
     }
+    let db = Arc::new(db::Database::new("data.db")?);
+
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(300)); // 每5分钟执行一次
+        loop {
+            interval.tick().await;
+            if let Err(e) = db_clone.run_scheduled_aggregation() {
+                eprintln!("Error running data aggregation: {}", e);
+            }
+        }
+    });
 
     // serv grpc
     tokio::spawn(async move { grpc::serv_grpc(cfg).await });

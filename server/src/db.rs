@@ -142,6 +142,54 @@ impl Database {
             )",
             [],
         )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS aggregated_stats (
+                id INTEGER PRIMARY KEY,
+                host_id INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                interval_minutes INTEGER NOT NULL,
+                cpu_usage REAL,
+                memory_total INTEGER,
+                memory_used INTEGER,
+                network_in INTEGER,
+                network_out INTEGER,
+                network_in_speed INTEGER,
+                network_out_speed INTEGER,
+                online BOOLEAN,
+                FOREIGN KEY (host_id) REFERENCES hosts(id),
+                UNIQUE(host_id, timestamp, interval_minutes)
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS aggregated_disk_stats (
+                id INTEGER PRIMARY KEY,
+                host_id INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                interval_minutes INTEGER NOT NULL,
+                mount_point TEXT NOT NULL,
+                disk_total INTEGER,
+                disk_used INTEGER,
+                FOREIGN KEY (host_id) REFERENCES hosts(id),
+                UNIQUE(host_id, timestamp, interval_minutes, mount_point)
+            )",
+            [],
+        )?;
+        
+        // ... existing code ...
+        
+        // 为聚合表添加索引
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agg_stats_host_time ON aggregated_stats(host_id, timestamp, interval_minutes)",
+            [],
+        )?;
+        
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agg_disk_stats_host_time ON aggregated_disk_stats(host_id, timestamp, interval_minutes)",
+            [],
+        )?;
         
         // 优化索引 - 添加更多索引以加速查询
         conn.execute(
@@ -264,6 +312,23 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let mut result = HashMap::new();
         
+        // 计算时间范围的长度（秒）
+        let time_range = end_time - start_time;
+        
+        // 根据时间范围选择合适的聚合级别
+        // 超过3天使用1小时聚合，超过1天使用30分钟聚合，超过12小时使用15分钟聚合，超过6小时使用5分钟聚合
+        let interval_minutes = if time_range > 3 * 24 * 3600 {
+            60 // 1小时
+        } else if time_range >= 24 * 3600 {
+            30 // 30分钟
+        } else if time_range >= 12 * 3600 {
+            15 // 15分钟
+        } else if time_range >= 1 * 3600 {
+            5  // 5分钟
+        } else {
+            0  // 使用原始数据
+        };
+
         // 获取时间范围内的所有主机
         let mut hosts_stmt = conn.prepare(
             "SELECT DISTINCT h.id, h.name, h.alias 
@@ -280,22 +345,94 @@ impl Database {
             ))
         })?;
         
+
         // 最大数据点数量，默认600
-        let max_points = 600;
+    let max_points = 600;
+    
+    for host_result in hosts {
+        let (host_id, host_name, host_alias) = host_result?;
         
-        for host_result in hosts {
-            let (host_id, host_name, host_alias) = host_result?;
-            
-            // 计算需要的时间窗口大小
-            let mut count_stmt = conn.prepare(
-                "SELECT COUNT(*) FROM stats 
-                 WHERE host_id = ? AND timestamp BETWEEN ? AND ?"
+        // 如果使用聚合数据且聚合级别大于0
+        if interval_minutes > 0 {
+            // 检查聚合表中是否有足够的数据
+            let mut count_agg_stmt = conn.prepare(
+                "SELECT COUNT(*) FROM aggregated_stats 
+                 WHERE host_id = ? AND timestamp BETWEEN ? AND ? AND interval_minutes = ?"
             )?;
             
-            let count: i64 = count_stmt.query_row(params![host_id, start_time, end_time], |row| row.get(0))?;
+            let agg_count: i64 = count_agg_stmt.query_row(
+                params![host_id, start_time, end_time, interval_minutes], 
+                |row| row.get(0)
+            )?;
             
-            // 如果数据点少于max_points，不需要聚合
-            if count <= max_points as i64 {
+            // 如果聚合表中有足够的数据
+            if agg_count > 0 {
+                // 使用聚合表查询
+                let mut stats_stmt = conn.prepare(
+                    "SELECT timestamp, cpu_usage, memory_total, memory_used, 
+                            network_in, network_out, network_in_speed, network_out_speed, online
+                     FROM aggregated_stats
+                     WHERE host_id = ? AND timestamp BETWEEN ? AND ? AND interval_minutes = ?
+                     ORDER BY timestamp ASC
+                     LIMIT ?"
+                )?;
+                
+                let stats = stats_stmt.query_map(
+                    params![host_id, start_time, end_time, interval_minutes, max_points], 
+                    |row| {
+                        Ok(HostStatRecord {
+                            timestamp: row.get(0)?,
+                            cpu: row.get(1)?,
+                            memory_total: row.get(2)?,
+                            memory_used: row.get(3)?,
+                            network_in: row.get(4)?,
+                            network_out: row.get(5)?,
+                            network_in_speed: row.get(6)?,
+                            network_out_speed: row.get(7)?,
+                            online: row.get(8)?,
+                            alias: host_alias.clone(),
+                            disks: Vec::new(),
+                        })
+                    }
+                )?;
+                
+                let mut host_stats = Vec::new();
+                for stat_result in stats {
+                    host_stats.push(stat_result?);
+                }
+                
+                // 如果有统计数据，获取聚合的磁盘数据
+                if !host_stats.is_empty() {
+                    for stat in &mut host_stats {
+                        // 从聚合磁盘表中获取对应时间戳的磁盘数据
+                        let mut disks_stmt = conn.prepare(
+                            "SELECT timestamp, mount_point, disk_total, disk_used
+                             FROM aggregated_disk_stats
+                             WHERE host_id = ? AND timestamp = ? AND interval_minutes = ?"
+                        )?;
+                        
+                        let disks = disks_stmt.query_map(
+                            params![host_id, stat.timestamp, interval_minutes], 
+                            |row| {
+                                Ok(DiskRecord {
+                                    timestamp: row.get(0)?,
+                                    mount_point: row.get(1)?,
+                                    total: row.get(2)?,
+                                    used: row.get(3)?,
+                                })
+                            }
+                        )?;
+                        
+                        for disk_result in disks {
+                            stat.disks.push(disk_result?);
+                        }
+                    }
+                }
+                
+                result.insert(host_name, host_stats);
+                continue; // 已经处理完这个主机，继续下一个
+            }
+        }else{
                 // 使用原始查询 - 添加LIMIT以防止返回过多数据
                 let mut stats_stmt = conn.prepare(
                     "SELECT timestamp, cpu_usage, memory_total, memory_used, 
@@ -364,111 +501,154 @@ impl Database {
                 }
                 
                 result.insert(host_name, host_stats);
-            } else {
-                // 需要聚合 - 计算窗口大小
-                let window_size = ((end_time - start_time) as f64 / max_points as f64).ceil() as i64;
-                
-                // 使用SQL的窗口函数和分组聚合
-                let mut stats_stmt = conn.prepare(
-                    "WITH windows AS (
-                        SELECT 
-                            (timestamp - ?) / ? AS window_id,
-                            AVG(timestamp) AS avg_timestamp,
-                            AVG(cpu_usage) AS avg_cpu,
-                            AVG(memory_total) AS avg_memory_total,
-                            AVG(memory_used) AS avg_memory_used,
-                            MAX(network_in) AS last_network_in,
-                            MAX(network_out) AS last_network_out,
-                            AVG(network_in_speed) AS avg_network_in_speed,
-                            AVG(network_out_speed) AS avg_network_out_speed,
-                            MAX(online) AS last_online
-                        FROM stats
-                        WHERE host_id = ? AND timestamp BETWEEN ? AND ?
-                        GROUP BY window_id
-                        ORDER BY window_id
-                        LIMIT ?
-                    )
-                    SELECT 
-                        CAST(avg_timestamp AS INTEGER),
-                        avg_cpu,
-                        CAST(avg_memory_total AS INTEGER),
-                        CAST(avg_memory_used AS INTEGER),
-                        CAST(last_network_in AS INTEGER),
-                        CAST(last_network_out AS INTEGER),
-                        CAST(avg_network_in_speed AS INTEGER),
-                        CAST(avg_network_out_speed AS INTEGER),
-                        last_online
-                    FROM windows"
-                )?;
-                
-                let stats = stats_stmt.query_map(params![start_time, window_size, host_id, start_time, end_time, max_points], |row| {
-                    Ok(HostStatRecord {
-                        timestamp: row.get(0)?,
-                        cpu: row.get(1)?,
-                        memory_total: row.get(2)?,
-                        memory_used: row.get(3)?,
-                        network_in: row.get(4)?,
-                        network_out: row.get(5)?,
-                        network_in_speed: row.get(6)?,
-                        network_out_speed: row.get(7)?,
-                        online: row.get(8)?,
-                        alias: host_alias.clone(),
-                        disks: Vec::new(),
-                    })
-                })?;
-                
-                let mut host_stats = Vec::new();
-                for stat_result in stats {
-                    host_stats.push(stat_result?);
-                }
-                
-                // 为聚合后的数据点添加最近的磁盘数据
-                // 获取所有唯一的挂载点
-                let mut mount_points_stmt = conn.prepare(
-                    "SELECT DISTINCT mount_point FROM disk_stats WHERE host_id = ?"
-                )?;
-                
-                let mount_points = mount_points_stmt.query_map(params![host_id], |row| {
-                    row.get::<_, String>(0)
-                })?;
-                
-                let mut unique_mounts = Vec::new();
-                for mp_result in mount_points {
-                    unique_mounts.push(mp_result?);
-                }
-                
-                // 为每个聚合点找到每个挂载点的最近磁盘数据
-                for stat in &mut host_stats {
-                    for mount_point in &unique_mounts {
-                        // 查找最接近当前时间戳的磁盘记录
-                        let mut closest_disk_stmt = conn.prepare(
-                            "SELECT timestamp, mount_point, disk_total, disk_used
-                             FROM disk_stats
-                             WHERE host_id = ? AND mount_point = ?
-                             ORDER BY ABS(timestamp - ?) ASC
-                             LIMIT 1"
-                        )?;
-                        
-                        if let Ok(disk) = closest_disk_stmt.query_row(params![host_id, mount_point, stat.timestamp], |row| {
-                            Ok(DiskRecord {
-                                timestamp: row.get(0)?,
-                                mount_point: row.get(1)?,
-                                total: row.get(2)?,
-                                used: row.get(3)?,
-                            })
-                        }) {
-                            stat.disks.push(disk);
-                        }
-                    }
-                }
-                
-                result.insert(host_name, host_stats);
-            }
+            
         }
+    }
         
         Ok(result)
     }
     
+    pub fn aggregate_data(&self, interval_minutes: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        
+        // 获取最新的聚合时间戳
+        let mut stmt = tx.prepare(
+            "SELECT MAX(timestamp) FROM aggregated_stats WHERE interval_minutes = ?"
+        )?;
+        let last_agg_time: Option<i64> = stmt.query_row(params![interval_minutes], |row| row.get(0)).ok();
+        
+        // 如果没有聚合记录，从最早的数据开始
+        let start_time = if let Some(time) = last_agg_time {
+            time
+        } else {
+            let mut stmt = tx.prepare("SELECT MIN(timestamp) FROM stats")?;
+            stmt.query_row([], |row| row.get::<_, i64>(0)).unwrap_or(0)
+        };
+        
+        // 计算当前时间对齐到interval_minutes的时间点
+        let now = Utc::now().timestamp();
+        let interval_seconds = interval_minutes * 60;
+        let end_time = (now / interval_seconds) * interval_seconds;
+        
+        // 如果没有新数据需要聚合，直接返回
+        if start_time >= end_time {
+            return Ok(());
+        }
+        
+        // 获取所有主机
+        let mut hosts_stmt = tx.prepare("SELECT id, name FROM hosts")?;
+        let hosts = hosts_stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        
+        for host_result in hosts {
+            let (host_id, _host_name) = host_result?;
+            
+            // 按interval_minutes聚合数据
+            let mut current_time = start_time;
+            while current_time < end_time {
+                let period_end = current_time + interval_seconds;
+                
+                // 聚合主机统计数据
+                let mut agg_stmt = tx.prepare(
+                    "SELECT 
+                        AVG(cpu_usage) as avg_cpu,
+                        AVG(memory_total) as avg_memory_total,
+                        AVG(memory_used) as avg_memory_used,
+                        MAX(network_in) as max_network_in,
+                        MAX(network_out) as max_network_out,
+                        AVG(network_in_speed) as avg_in_speed,
+                        AVG(network_out_speed) as avg_out_speed,
+                        MAX(online) as was_online
+                     FROM stats
+                     WHERE host_id = ? AND timestamp >= ? AND timestamp < ?"
+                )?;
+                
+                if let Ok(row) = agg_stmt.query_row(params![host_id, current_time, period_end], |row| {
+                    Ok((
+                        row.get::<_, Option<f64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<bool>>(7)?,
+                    ))
+                }) {
+                    let (cpu, mem_total, mem_used, net_in, net_out, in_speed, out_speed, online) = row;
+                    
+                    // 只有当有数据时才插入聚合记录
+                    if cpu.is_some() || mem_total.is_some() {
+                        // 使用 INSERT OR REPLACE 处理可能的重复
+                        tx.execute(
+                            "INSERT OR REPLACE INTO aggregated_stats (
+                                host_id, timestamp, interval_minutes, cpu_usage, 
+                                memory_total, memory_used, network_in, network_out,
+                                network_in_speed, network_out_speed, online
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            params![
+                                host_id,
+                                current_time,
+                                interval_minutes,
+                                cpu.unwrap_or(0.0),
+                                mem_total.unwrap_or(0),
+                                mem_used.unwrap_or(0),
+                                net_in.unwrap_or(0),
+                                net_out.unwrap_or(0),
+                                in_speed.unwrap_or(0),
+                                out_speed.unwrap_or(0),
+                                online.unwrap_or(false)
+                            ],
+                        )?;
+                    }
+                    
+                    // 聚合磁盘数据 - 按挂载点分组
+                    let mut disk_stmt = tx.prepare(
+                        "SELECT 
+                            mount_point,
+                            AVG(disk_total) as avg_total,
+                            AVG(disk_used) as avg_used
+                         FROM disk_stats
+                         WHERE host_id = ? AND timestamp >= ? AND timestamp < ?
+                         GROUP BY mount_point"
+                    )?;
+                    
+                    let disks = disk_stmt.query_map(params![host_id, current_time, period_end], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    
+                    for disk_result in disks {
+                        let (mount_point, total, used) = disk_result?;
+                        
+                        tx.execute(
+                            "INSERT OR REPLACE INTO aggregated_disk_stats (
+                                host_id, timestamp, interval_minutes, mount_point, disk_total, disk_used
+                            ) VALUES (?, ?, ?, ?, ?, ?)",
+                            params![
+                                host_id,
+                                current_time,
+                                interval_minutes,
+                                mount_point,
+                                total,
+                                used
+                            ],
+                        )?;
+                    }
+                }
+                
+                current_time = period_end;
+            }
+        }
+        
+        tx.commit()?;
+        Ok(())
+    }
     // 添加清理旧数据的方法
     pub fn _cleanup_old_data(&self, retention_days: i64) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
@@ -494,6 +674,21 @@ impl Database {
         Ok(stats_deleted + disks_deleted)
     }
     
+    pub fn run_scheduled_aggregation(&self) -> Result<()> {
+        // 执行5分钟聚合
+        self.aggregate_data(5)?;
+        
+        // 执行15分钟聚合
+        self.aggregate_data(15)?;
+        
+        // 执行30分钟聚合
+        self.aggregate_data(30)?;
+        
+        // 执行60分钟聚合
+        self.aggregate_data(60)?;
+        
+        Ok(())
+    }
     // 添加数据库优化方法
     pub fn _optimize(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
