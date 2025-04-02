@@ -86,7 +86,7 @@ pub struct HostStat {
     pub weight: u64,
 
     // user data
-    #[serde(skip_deserializing)]
+    #[serde(default)]
     pub latest_ts: u64,
 
     #[serde(skip_serializing, skip_deserializing)]
