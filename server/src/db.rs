@@ -513,10 +513,12 @@ impl Database {
         let tx = conn.transaction()?;
         
         // 获取最新的聚合时间戳
-        let mut stmt = tx.prepare(
-            "SELECT MAX(timestamp) FROM aggregated_stats WHERE interval_minutes = ?"
-        )?;
-        let last_agg_time: Option<i64> = stmt.query_row(params![interval_minutes], |row| row.get(0)).ok();
+        let last_agg_time: Option<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT MAX(timestamp) FROM aggregated_stats WHERE interval_minutes = ?"
+            )?;
+            stmt.query_row(params![interval_minutes], |row| row.get(0)).ok()
+        };  // 使用代码块限制 stmt 的作用域
         
         // 如果没有聚合记录，从最早的数据开始
         let start_time = if let Some(time) = last_agg_time {
@@ -537,48 +539,56 @@ impl Database {
         }
         
         // 获取所有主机
-        let mut hosts_stmt = tx.prepare("SELECT id, name FROM hosts")?;
-        let hosts = hosts_stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        
-        for host_result in hosts {
-            let (host_id, _host_name) = host_result?;
+        let hosts: Vec<(i64, String)> = {
+            let mut hosts_stmt = tx.prepare("SELECT id, name FROM hosts")?;
+            let hosts_iter = hosts_stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
             
+            let mut result = Vec::new();
+            for host_result in hosts_iter {
+                result.push(host_result?);
+            }
+            result
+        };  // 使用代码块限制 hosts_stmt 的作用域
+        
+        for (host_id, _host_name) in hosts {
             // 按interval_minutes聚合数据
             let mut current_time = start_time;
             while current_time < end_time {
                 let period_end = current_time + interval_seconds;
                 
                 // 聚合主机统计数据
-                let mut agg_stmt = tx.prepare(
-                    "SELECT 
-                        AVG(cpu_usage) as avg_cpu,
-                        AVG(memory_total) as avg_memory_total,
-                        AVG(memory_used) as avg_memory_used,
-                        MAX(network_in) as max_network_in,
-                        MAX(network_out) as max_network_out,
-                        AVG(network_in_speed) as avg_in_speed,
-                        AVG(network_out_speed) as avg_out_speed,
-                        MAX(online) as was_online
-                     FROM stats
-                     WHERE host_id = ? AND timestamp >= ? AND timestamp < ?"
-                )?;
-                
-                if let Ok(row) = agg_stmt.query_row(params![host_id, current_time, period_end], |row| {
-                    Ok((
-                        row.get::<_, Option<f64>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                        row.get::<_, Option<i64>>(5)?,
-                        row.get::<_, Option<i64>>(6)?,
-                        row.get::<_, Option<bool>>(7)?,
-                    ))
-                }) {
-                    let (cpu, mem_total, mem_used, net_in, net_out, in_speed, out_speed, online) = row;
+                let row_opt = {
+                    let mut agg_stmt = tx.prepare(
+                        "SELECT 
+                            AVG(cpu_usage) as avg_cpu,
+                            AVG(memory_total) as avg_memory_total,
+                            AVG(memory_used) as avg_memory_used,
+                            MAX(network_in) as max_network_in,
+                            MAX(network_out) as max_network_out,
+                            AVG(network_in_speed) as avg_in_speed,
+                            AVG(network_out_speed) as avg_out_speed,
+                            MAX(online) as was_online
+                         FROM stats
+                         WHERE host_id = ? AND timestamp >= ? AND timestamp < ?"
+                    )?;
                     
+                    agg_stmt.query_row(params![host_id, current_time, period_end], |row| {
+                        Ok((
+                            row.get::<_, Option<f64>>(0)?,
+                            row.get::<_, Option<i64>>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<bool>>(7)?,
+                        ))
+                    }).ok()
+                };  // 使用代码块限制 agg_stmt 的作用域
+                
+                if let Some((cpu, mem_total, mem_used, net_in, net_out, in_speed, out_speed, online)) = row_opt {
                     // 只有当有数据时才插入聚合记录
                     if cpu.is_some() || mem_total.is_some() {
                         // 使用 INSERT OR REPLACE 处理可能的重复
