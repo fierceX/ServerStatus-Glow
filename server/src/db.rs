@@ -728,14 +728,16 @@ impl Database {
         // 执行60分钟聚合
         self.aggregate_data(60)?;
 
-        self.cleanup_old_data(1)?;
+        
 
         Ok(())
     }
     // 添加数据库优化方法
-    pub fn _optimize(&self) -> Result<()> {
+    pub fn optimize(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();  // 修改这里，添加 mut 关键字
 
+        self.cleanup_old_data(1)?;
+        
         // 运行VACUUM来整理数据库文件
         conn.execute_batch("VACUUM")?;
 

@@ -198,6 +198,17 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     });
 
+    let db_clone2 = db.clone();
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(24*60*60)); // 每天执行一次
+        loop {
+            interval.tick().await;
+            if let Err(e) = db_clone2.optimize() {
+                eprintln!("Error running data optimize: {}", e);
+            }
+        }
+    });
+
     // serv grpc
     tokio::spawn(async move { grpc::serv_grpc(cfg).await });
 
