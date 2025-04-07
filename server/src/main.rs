@@ -185,7 +185,7 @@ async fn main() -> Result<(), anyhow::Error> {
         error!("can't set G_STATS_MGR");
         process::exit(1);
     }
-    let db = Arc::new(db::Database::new("data.db")?);
+    let db = Arc::new(db::Database::new("stats.db")?);
 
     let db_clone = db.clone();
     tokio::spawn(async move {
